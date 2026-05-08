@@ -93,6 +93,7 @@ def analyze_audio(
     output_directory: str,
 ) -> LoadedAudio:
     audio_path = _validate_raw_audio_path(raw_audio_path)
+    output_path = _validate_output_directory_path(output_directory)
     samples, sample_rate = _load_audio(audio_path)
     duration_seconds = _validate_loaded_audio(samples, sample_rate)
     pitch_frames = _detect_pitch_frames(samples, sample_rate)
@@ -101,12 +102,12 @@ def analyze_audio(
     adjusted_notes = _adjust_notes_to_scale(original_notes, scale_fit)
     quantized_notes = _quantize_notes(adjusted_notes)
     chords = _infer_chords(quantized_notes, scale_fit)
-    midi_path = _write_midi_file(audio_id, Path(output_directory), quantized_notes, chords)
+    midi_path = _write_midi_file(audio_id, output_path, quantized_notes, chords)
 
     return LoadedAudio(
         audio_id=audio_id,
         raw_audio_path=audio_path,
-        output_directory=Path(output_directory),
+        output_directory=output_path,
         samples=samples,
         sample_rate=sample_rate,
         duration_seconds=duration_seconds,
@@ -132,6 +133,13 @@ def _validate_raw_audio_path(raw_audio_path: str) -> Path:
         raise AudioProcessingError(f"Audio path is not a file: {audio_path}")
 
     return audio_path
+
+
+def _validate_output_directory_path(output_directory: str) -> Path:
+    if not output_directory or not output_directory.strip():
+        raise AudioProcessingError("outputDirectory is required")
+
+    return Path(output_directory)
 
 
 def _load_audio(audio_path: Path) -> tuple[np.ndarray, int]:

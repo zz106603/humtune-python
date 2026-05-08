@@ -14,6 +14,8 @@ def test_audio_analyze_success_creates_midi(tmp_path: Path) -> None:
     raw_audio_path = tmp_path / "melody.wav"
     output_directory = tmp_path / "output"
     _write_test_melody(raw_audio_path)
+    raw_audio_path = raw_audio_path.resolve()
+    output_directory = output_directory.resolve()
 
     response = client.post(
         "/internal/audio/analyze",
@@ -35,7 +37,9 @@ def test_audio_analyze_success_creates_midi(tmp_path: Path) -> None:
     assert body["chords"]
     assert body["midiPath"]
     assert isinstance(body["processingTimeMs"], int)
-    assert Path(body["midiPath"]).is_file()
+    midi_path = Path(body["midiPath"])
+    assert midi_path.is_file()
+    assert midi_path.parent == output_directory
 
 
 def test_audio_analyze_fails_for_missing_raw_audio_path(tmp_path: Path) -> None:
