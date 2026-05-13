@@ -1,9 +1,11 @@
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import librosa
 import mido
 import numpy as np
+import soundfile as sf
 
 
 TARGET_SAMPLE_RATE = 22050
@@ -31,6 +33,11 @@ MIDI_CHORD_CHANNEL = 1
 MIDI_PIANO_PROGRAM = 0
 MIDI_CHORD_VELOCITY = 64
 CHORD_BASE_OCTAVE_MIDI = 48
+PREVIEW_SAMPLE_RATE = 22050
+PREVIEW_BASE_AMPLITUDE = 0.18
+PREVIEW_ATTACK_SECONDS = 0.005
+PREVIEW_RELEASE_SECONDS = 0.03
+PREVIEW_PEAK_HEADROOM = 0.95
 
 
 class AudioProcessingError(Exception):
@@ -85,6 +92,14 @@ class LoadedAudio:
     quantized_notes: list[Note]
     chords: list[Chord]
     midiPath: str
+    previewAudioPath: str | None
+
+
+class PreviewNote(NamedTuple):
+    midi_note: int
+    velocity: int
+    start_time: float
+    duration: float
 
 
 def analyze_audio(
@@ -103,6 +118,7 @@ def analyze_audio(
     quantized_notes = _quantize_notes(adjusted_notes)
     chords = _infer_chords(quantized_notes, scale_fit)
     midi_path = _write_midi_file(audio_id, output_path, quantized_notes, chords)
+    preview_audio_path = _try_write_wav_preview_file(audio_id, output_path, midi_path)
 
     return LoadedAudio(
         audio_id=audio_id,
@@ -119,6 +135,7 @@ def analyze_audio(
         quantized_notes=quantized_notes,
         chords=chords,
         midiPath=str(midi_path),
+        previewAudioPath=str(preview_audio_path) if preview_audio_path else None,
     )
 
 
@@ -583,6 +600,136 @@ def _write_midi_file(
         raise AudioProcessingError(f"Unable to write MIDI file: {midi_path}") from exc
 
     return midi_path
+
+
+def _try_write_wav_preview_file(audio_id: str, output_directory: Path, midi_path: Path) -> Path | None:
+    try:
+        return _write_wav_preview_file(audio_id, output_directory, midi_path)
+    except Exception as exc:
+        print(f"wav_preview_generation_failed midi_path={midi_path} error={exc}", flush=True)
+        return None
+
+
+def _write_wav_preview_file(audio_id: str, output_directory: Path, midi_path: Path) -> Path:
+    preview_notes = _extract_preview_notes_from_midi(midi_path)
+    if not preview_notes:
+        raise AudioProcessingError("No MIDI notes available for WAV preview generation")
+
+    preview_path = output_directory / f"{audio_id}-preview.wav"
+    samples = _render_preview_notes_to_samples(preview_notes)
+
+    try:
+        sf.write(preview_path, samples, PREVIEW_SAMPLE_RATE, subtype="PCM_16")
+    except Exception as exc:
+        raise AudioProcessingError(f"Unable to write WAV preview file: {preview_path}") from exc
+
+    return preview_path
+
+
+def _extract_preview_notes_from_midi(midi_path: Path) -> list[PreviewNote]:
+    try:
+        midi_file = mido.MidiFile(midi_path)
+    except Exception as exc:
+        raise AudioProcessingError(f"Unable to read MIDI file for WAV preview: {midi_path}") from exc
+
+    tempo = mido.bpm2tempo(FALLBACK_TEMPO_BPM)
+    elapsed_seconds = 0.0
+    active_notes: dict[tuple[int, int], list[tuple[float, int]]] = {}
+    preview_notes: list[PreviewNote] = []
+
+    for message in mido.merge_tracks(midi_file.tracks):
+        elapsed_seconds += mido.tick2second(message.time, midi_file.ticks_per_beat, tempo)
+
+        if message.type == "set_tempo":
+            tempo = message.tempo
+            continue
+
+        if message.type == "note_on" and message.velocity > 0:
+            key = (message.channel, message.note)
+            active_notes.setdefault(key, []).append((elapsed_seconds, message.velocity))
+            continue
+
+        is_note_end = message.type == "note_off" or (
+            message.type == "note_on" and message.velocity == 0
+        )
+        if not is_note_end:
+            continue
+
+        key = (message.channel, message.note)
+        starts = active_notes.get(key)
+        if not starts:
+            continue
+
+        start_time, velocity = starts.pop()
+        if not starts:
+            del active_notes[key]
+
+        duration = elapsed_seconds - start_time
+        if duration > 0:
+            preview_notes.append(
+                PreviewNote(
+                    midi_note=message.note,
+                    velocity=velocity,
+                    start_time=start_time,
+                    duration=duration,
+                )
+            )
+
+    return preview_notes
+
+
+def _render_preview_notes_to_samples(preview_notes: list[PreviewNote]) -> np.ndarray:
+    end_time = max(note.start_time + note.duration for note in preview_notes)
+    total_samples = int(np.ceil((end_time + PREVIEW_RELEASE_SECONDS) * PREVIEW_SAMPLE_RATE))
+    samples = np.zeros(total_samples, dtype=np.float32)
+
+    for note in preview_notes:
+        start_index = int(round(note.start_time * PREVIEW_SAMPLE_RATE))
+        note_sample_count = max(1, int(round(note.duration * PREVIEW_SAMPLE_RATE)))
+        release_sample_count = int(round(PREVIEW_RELEASE_SECONDS * PREVIEW_SAMPLE_RATE))
+        tone_sample_count = note_sample_count + release_sample_count
+
+        times = np.arange(tone_sample_count, dtype=np.float32) / PREVIEW_SAMPLE_RATE
+        frequency = 440.0 * (2.0 ** ((note.midi_note - 69) / 12.0))
+        tone = np.sin(2.0 * np.pi * frequency * times)
+        envelope = _build_preview_envelope(note_sample_count, release_sample_count)
+        amplitude = PREVIEW_BASE_AMPLITUDE * (note.velocity / 127.0)
+        rendered_note = (tone * envelope * amplitude).astype(np.float32)
+
+        end_index = min(samples.size, start_index + rendered_note.size)
+        samples[start_index:end_index] += rendered_note[: end_index - start_index]
+
+    peak = float(np.max(np.abs(samples)))
+    if peak > PREVIEW_PEAK_HEADROOM:
+        samples *= PREVIEW_PEAK_HEADROOM / peak
+
+    return samples
+
+
+def _build_preview_envelope(note_sample_count: int, release_sample_count: int) -> np.ndarray:
+    envelope = np.ones(note_sample_count + release_sample_count, dtype=np.float32)
+    attack_sample_count = min(
+        note_sample_count,
+        max(1, int(round(PREVIEW_ATTACK_SECONDS * PREVIEW_SAMPLE_RATE))),
+    )
+    envelope[:attack_sample_count] = np.linspace(
+        0.0,
+        1.0,
+        attack_sample_count,
+        endpoint=True,
+        dtype=np.float32,
+    )
+
+    if release_sample_count > 0:
+        envelope[note_sample_count:] = np.linspace(
+            1.0,
+            0.0,
+            release_sample_count,
+            endpoint=True,
+            dtype=np.float32,
+        )
+
+    return envelope
 
 
 def _append_note_events(

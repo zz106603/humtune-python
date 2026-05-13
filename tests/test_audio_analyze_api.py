@@ -36,10 +36,15 @@ def test_audio_analyze_success_creates_midi(tmp_path: Path) -> None:
     assert body["adjustedNotes"]
     assert body["chords"]
     assert body["midiPath"]
+    assert body["previewAudioPath"]
     assert isinstance(body["processingTimeMs"], int)
     midi_path = Path(body["midiPath"])
+    preview_audio_path = Path(body["previewAudioPath"])
     assert midi_path.is_file()
     assert midi_path.parent == output_directory
+    assert preview_audio_path.is_file()
+    assert preview_audio_path.parent == output_directory
+    assert preview_audio_path.suffix == ".wav"
 
 
 def test_audio_analyze_fails_for_missing_raw_audio_path(tmp_path: Path) -> None:

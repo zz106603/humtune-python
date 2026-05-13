@@ -70,6 +70,7 @@ def analyze_audio(request: AudioAnalyzeRequest) -> AudioAnalyzeResponse:
         adjustedNotes=[note.pitch for note in result.adjusted_notes],
         chords=[_format_chord(chord) for chord in result.chords],
         midiPath=result.midiPath,
+        previewAudioPath=result.previewAudioPath,
         processingTimeMs=processing_time_ms,
     )
 

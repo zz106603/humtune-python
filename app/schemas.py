@@ -15,5 +15,6 @@ class AudioAnalyzeResponse(BaseModel):
     adjustedNotes: list[str] | None = None
     chords: list[str] | None = None
     midiPath: str | None = None
+    previewAudioPath: str | None = None
     processingTimeMs: int | None = None
     errorMessage: str | None = None
