@@ -251,6 +251,7 @@ POST /internal/audio/analyze
 - adjustedNotes
 - chords
 - midiPath
+- previewAudioPath
 
 실패:
 
@@ -322,6 +323,8 @@ POST /internal/audio/analyze
 POST /api/audio  
 GET /api/audio/{audioId}  
 GET /api/audio/{audioId}/result
+GET /api/audio/{audioId}/files/preview
+GET /api/audio/{audioId}/files/midi
 
 ---
 
@@ -339,6 +342,7 @@ GET /api/audio/{audioId}/result
 
 - raw audio
 - MIDI
+- preview audio
 
 ---
 
