@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import librosa
 import mido
@@ -27,12 +27,25 @@ NOTE_MERGE_TOLERANCE_SEMITONES = 1
 NOTE_CLEANUP_MIN_DURATION_SECONDS = 0.08
 NOTE_CLEANUP_MERGE_GAP_SECONDS = 0.04
 NOTE_CLEANUP_SPIKE_MAX_DURATION_SECONDS = 0.18
+BASIC_PITCH_TRANSIENT_MAX_SECONDS = 0.06
+BASIC_PITCH_LOW_VELOCITY_TRANSIENT_MAX_SECONDS = 0.10
+BASIC_PITCH_LOW_VELOCITY_THRESHOLD = 45
+BASIC_PITCH_FRAGMENT_MERGE_GAP_SECONDS = 0.10
+BASIC_PITCH_FRAGMENT_MAX_SECONDS = 0.12
+BASIC_PITCH_REPEATED_ONSET_MIN_GAP_SECONDS = 0.24
+BASIC_PITCH_REPEATED_NOTE_MIN_SECONDS = 0.18
+BASIC_PITCH_SIMULTANEOUS_ONSET_SECONDS = 0.035
+BASIC_PITCH_OVERLAP_RATIO_THRESHOLD = 0.6
+BASIC_PITCH_CHROMATIC_TRANSIENT_MAX_SECONDS = 0.17
+BASIC_PITCH_SHORT_NEIGHBOR_TRANSIENT_MAX_SECONDS = 0.13
 DEFAULT_NOTE_VELOCITY = 80
 MIDI_NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 MAJOR_SCALE_INTERVALS = (0, 2, 4, 5, 7, 9, 11)
 MINOR_SCALE_INTERVALS = (0, 2, 3, 5, 7, 8, 10)
 FALLBACK_TEMPO_BPM = 100
 QUANTIZE_GRID_SECONDS = (60.0 / FALLBACK_TEMPO_BPM) / 2.0
+QUANTIZE_ONSET_SNAP_TOLERANCE_SECONDS = 0.05
+QUANTIZE_DURATION_SNAP_TOLERANCE_SECONDS = 0.05
 INTERNAL_REPEAT_SPLIT_MIN_SECONDS = QUANTIZE_GRID_SECONDS * 2.5
 INTERNAL_REPEAT_TARGET_SECONDS = QUANTIZE_GRID_SECONDS
 RHYTHM_BUCKET_SECONDS = (
@@ -43,8 +56,13 @@ RHYTHM_BUCKET_SECONDS = (
 )
 AUDIBLE_MIN_NOTE_SECONDS = RHYTHM_BUCKET_SECONDS[0]
 CHORD_WINDOW_SECONDS = 4 * (60.0 / FALLBACK_TEMPO_BPM)
+CHORD_TARGET_SECTION_SECONDS = 1.6
+CHORD_SHORT_MELODY_MAX_SECONDS = 8.0
+CHORD_SHORT_MELODY_MAX_WINDOWS = 4
 MAJOR_CHORD_TIEBREAK_DEGREES = (0, 3, 4, 5, 1, 2, 6)
 MINOR_CHORD_TIEBREAK_DEGREES = (0, 3, 4, 5, 6, 2, 1)
+CHORD_WINDOW_ROOT_BONUS = 0.8
+CHORD_INITIAL_TONIC_BONUS = 0.5
 MIDI_TICKS_PER_BEAT = 480
 MIDI_MELODY_CHANNEL = 0
 MIDI_CHORD_CHANNEL = 1
@@ -111,6 +129,7 @@ class LoadedAudio:
     duration_seconds: float
     pitch_frames: list[PitchFrame]
     original_notes: list[Note]
+    cleaned_notes: list[Note]
     detectedScale: str
     keyConfidence: float
     adjusted_notes: list[Note]
@@ -165,8 +184,8 @@ def analyze_audio(
     output_path = _validate_output_directory_path(output_directory)
     samples, sample_rate = _load_audio(audio_path)
     duration_seconds = _validate_loaded_audio(samples, sample_rate)
-    pitch_frames = _detect_pitch_frames(samples, sample_rate)
-    original_notes = _pitch_frames_to_notes(pitch_frames)
+    pitch_frames: list[PitchFrame] = []
+    original_notes = _transcribe_notes_with_basic_pitch(audio_path)
     cleanup_result = _cleanup_notes_with_metrics(original_notes)
     _log_note_cleanup_metrics(audio_id, cleanup_result)
     cleaned_notes = cleanup_result.notes
@@ -199,6 +218,7 @@ def analyze_audio(
         duration_seconds=duration_seconds,
         pitch_frames=pitch_frames,
         original_notes=original_notes,
+        cleaned_notes=cleaned_notes,
         detectedScale=scale_fit.name,
         keyConfidence=scale_fit.confidence,
         adjusted_notes=adjusted_notes,
@@ -240,6 +260,65 @@ def _load_audio(audio_path: Path) -> tuple[np.ndarray, int]:
         raise AudioProcessingError(f"Unable to read audio file: {audio_path}") from exc
 
     return samples, sample_rate
+
+
+def _transcribe_notes_with_basic_pitch(audio_path: Path) -> list[Note]:
+    try:
+        from basic_pitch.inference import predict
+    except ModuleNotFoundError as exc:
+        raise AudioProcessingError(
+            "Basic Pitch is required for note transcription"
+        ) from exc
+
+    try:
+        _, _, note_events = predict(str(audio_path))
+    except Exception as exc:
+        raise AudioProcessingError("Unable to transcribe notes with Basic Pitch") from exc
+
+    notes = [
+        _basic_pitch_event_to_note(event)
+        for event in note_events
+    ]
+    usable_notes = [
+        note
+        for note in notes
+        if note.duration > 0
+    ]
+    if not usable_notes:
+        raise AudioProcessingError("Basic Pitch produced no usable note events")
+
+    return sorted(usable_notes, key=lambda note: (note.startTime, note.midi_note))
+
+
+def _basic_pitch_event_to_note(event: Any) -> Note:
+    if isinstance(event, dict):
+        start_time = _event_value(event, "start_time_s", "start_time", "start", "onset")
+        end_time = _event_value(event, "end_time_s", "end_time", "end", "offset")
+        midi_note = int(round(_event_value(event, "pitch_midi", "midi_pitch", "pitch")))
+        confidence = _event_value(event, "amplitude", "confidence", "velocity", default=0.75)
+    else:
+        start_time = float(event[0])
+        end_time = float(event[1])
+        midi_note = int(round(float(event[2])))
+        confidence = float(event[3]) if len(event) > 3 else 0.75
+
+    velocity = max(1, min(127, int(round(confidence * 127))))
+    return Note(
+        pitch=_midi_note_to_name(midi_note),
+        midi_note=midi_note,
+        startTime=float(start_time),
+        duration=float(end_time - start_time),
+        velocity=velocity or DEFAULT_NOTE_VELOCITY,
+    )
+
+
+def _event_value(event: dict[str, Any], *keys: str, default: float | None = None) -> float:
+    for key in keys:
+        if key in event:
+            return float(event[key])
+    if default is not None:
+        return default
+    raise AudioProcessingError(f"Basic Pitch event missing one of: {', '.join(keys)}")
 
 
 def _validate_loaded_audio(samples: np.ndarray, sample_rate: int) -> float:
@@ -509,10 +588,12 @@ def _cleanup_notes_with_metrics(notes: list[Note]) -> NoteCleanupResult:
         raise AudioProcessingError("No notes available for cleanup")
 
     ordered_notes = sorted(notes, key=lambda note: (note.startTime, note.midi_note))
-    smoothed_notes = _smooth_isolated_pitch_spikes(ordered_notes)
+    normalized_input_notes = _normalize_transcribed_notes(ordered_notes)
+    dropped_transient_note_count = len(ordered_notes) - len(normalized_input_notes)
+    smoothed_notes = _smooth_isolated_pitch_spikes(normalized_input_notes)
     merged_notes, merged_note_count = _merge_adjacent_similar_notes(smoothed_notes)
     cleaned_notes = _drop_short_notes(merged_notes)
-    dropped_short_note_count = len(merged_notes) - len(cleaned_notes)
+    dropped_short_note_count = dropped_transient_note_count + len(merged_notes) - len(cleaned_notes)
 
     if not cleaned_notes:
         raise AudioProcessingError("No valid notes found after cleanup")
@@ -528,6 +609,121 @@ def _cleanup_notes_with_metrics(notes: list[Note]) -> NoteCleanupResult:
         dropped_short_note_count=dropped_short_note_count,
         merged_note_count=merged_note_count,
         overlap_fix_count=overlap_fix_count,
+    )
+
+
+def _normalize_transcribed_notes(notes: list[Note]) -> list[Note]:
+    stable_notes = [
+        note
+        for note in notes
+        if _is_stable_transcribed_note(note)
+    ]
+    melody_candidates = _suppress_overlapping_transcription_candidates(stable_notes)
+    return _filter_pitch_transients(melody_candidates)
+
+
+def _is_stable_transcribed_note(note: Note) -> bool:
+    _validate_note_timing(note)
+    if note.duration < BASIC_PITCH_TRANSIENT_MAX_SECONDS:
+        return False
+    if (
+        note.duration < BASIC_PITCH_LOW_VELOCITY_TRANSIENT_MAX_SECONDS
+        and note.velocity < BASIC_PITCH_LOW_VELOCITY_THRESHOLD
+    ):
+        return False
+    if note.midi_note < _frequency_to_midi_note(MIN_PITCH_HZ):
+        return False
+    if note.midi_note > _frequency_to_midi_note(MAX_PITCH_HZ):
+        return False
+    return True
+
+
+def _suppress_overlapping_transcription_candidates(notes: list[Note]) -> list[Note]:
+    selected_notes: list[Note] = []
+    for note in notes:
+        if not selected_notes:
+            selected_notes.append(note)
+            continue
+
+        previous_note = selected_notes[-1]
+        if not _is_competing_transcription_candidate(previous_note, note):
+            selected_notes.append(note)
+            continue
+
+        if _note_priority(note) > _note_priority(previous_note):
+            selected_notes[-1] = note
+
+    return selected_notes
+
+
+def _is_competing_transcription_candidate(first_note: Note, second_note: Note) -> bool:
+    if abs(first_note.startTime - second_note.startTime) > BASIC_PITCH_SIMULTANEOUS_ONSET_SECONDS:
+        return False
+
+    overlap = _note_overlap_seconds(first_note, second_note)
+    if overlap <= 0:
+        return False
+
+    shorter_duration = min(first_note.duration, second_note.duration)
+    return (overlap / shorter_duration) >= BASIC_PITCH_OVERLAP_RATIO_THRESHOLD
+
+
+def _note_priority(note: Note) -> tuple[float, float, int]:
+    return (note.duration, note.velocity, -abs(note.midi_note - 60))
+
+
+def _note_overlap_seconds(first_note: Note, second_note: Note) -> float:
+    start_time = max(first_note.startTime, second_note.startTime)
+    end_time = min(
+        first_note.startTime + first_note.duration,
+        second_note.startTime + second_note.duration,
+    )
+    return max(0.0, end_time - start_time)
+
+
+def _filter_pitch_transients(notes: list[Note]) -> list[Note]:
+    if len(notes) < 3:
+        return notes
+
+    filtered_notes: list[Note] = []
+    for index, note in enumerate(notes):
+        if index == 0 or index == len(notes) - 1:
+            filtered_notes.append(note)
+            continue
+
+        previous_note = notes[index - 1]
+        next_note = notes[index + 1]
+        if _is_pitch_transient(previous_note, note, next_note):
+            continue
+
+        filtered_notes.append(note)
+
+    return filtered_notes
+
+
+def _is_pitch_transient(previous_note: Note, note: Note, next_note: Note) -> bool:
+    if note.duration > BASIC_PITCH_CHROMATIC_TRANSIENT_MAX_SECONDS:
+        return False
+    if note.midi_note == previous_note.midi_note or note.midi_note == next_note.midi_note:
+        return False
+
+    previous_interval = note.midi_note - previous_note.midi_note
+    next_interval = next_note.midi_note - note.midi_note
+    if _is_short_chromatic_neighbor(note, next_interval):
+        return True
+
+    return (
+        abs(previous_interval) == 1
+        and abs(next_interval) >= 2
+        and previous_note.duration >= note.duration
+        and next_note.duration >= note.duration
+    )
+
+
+def _is_short_chromatic_neighbor(note: Note, next_interval: int) -> bool:
+    return (
+        note.duration <= BASIC_PITCH_SHORT_NEIGHBOR_TRANSIENT_MAX_SECONDS
+        and abs(next_interval) == 1
     )
 
 
@@ -661,12 +857,29 @@ def _should_merge_adjacent_notes(
     note: Note,
     gap_seconds: float,
 ) -> bool:
-    if gap_seconds < 0:
-        return previous_note.midi_note == note.midi_note
-    if gap_seconds > NOTE_CLEANUP_MERGE_GAP_SECONDS:
+    if previous_note.midi_note != note.midi_note:
         return False
+    if _looks_like_repeated_articulation(previous_note, note):
+        return False
+    if gap_seconds < 0:
+        return True
+    if gap_seconds <= NOTE_CLEANUP_MERGE_GAP_SECONDS:
+        return True
 
-    return previous_note.midi_note == note.midi_note
+    return (
+        gap_seconds <= BASIC_PITCH_FRAGMENT_MERGE_GAP_SECONDS
+        and min(previous_note.duration, note.duration) <= BASIC_PITCH_FRAGMENT_MAX_SECONDS
+    )
+
+
+def _looks_like_repeated_articulation(previous_note: Note, note: Note) -> bool:
+    onset_gap = note.startTime - previous_note.startTime
+    if onset_gap < BASIC_PITCH_REPEATED_ONSET_MIN_GAP_SECONDS:
+        return False
+    return (
+        previous_note.duration >= BASIC_PITCH_REPEATED_NOTE_MIN_SECONDS
+        and note.duration >= BASIC_PITCH_REPEATED_NOTE_MIN_SECONDS
+    )
 
 
 def _merge_notes(first_note: Note, second_note: Note) -> Note:
@@ -703,29 +916,55 @@ def _drop_short_notes(notes: list[Note]) -> list[Note]:
 
 def _remove_note_overlaps(notes: list[Note]) -> tuple[list[Note], int]:
     normalized_notes: list[Note] = []
-    previous_end_time = 0.0
     overlap_fix_count = 0
 
     for note in notes:
-        start_time = max(note.startTime, previous_end_time)
-        if start_time > note.startTime:
-            overlap_fix_count += 1
-        end_time = max(start_time, note.startTime + note.duration)
-        duration = end_time - start_time
-        if duration < NOTE_CLEANUP_MIN_DURATION_SECONDS:
+        if not normalized_notes:
+            normalized_notes.append(note)
             continue
 
-        normalized_note = Note(
-            pitch=note.pitch,
-            midi_note=note.midi_note,
-            startTime=float(start_time),
-            duration=float(duration),
-            velocity=note.velocity,
-        )
-        normalized_notes.append(normalized_note)
-        previous_end_time = start_time + duration
+        previous_note = normalized_notes[-1]
+        previous_end_time = previous_note.startTime + previous_note.duration
+        if note.startTime >= previous_end_time:
+            normalized_notes.append(note)
+            continue
+
+        overlap_fix_count += 1
+        if _should_drop_overlapping_note(previous_note, note):
+            continue
+
+        trimmed_previous_duration = note.startTime - previous_note.startTime
+        if trimmed_previous_duration >= NOTE_CLEANUP_MIN_DURATION_SECONDS:
+            normalized_notes[-1] = Note(
+                pitch=previous_note.pitch,
+                midi_note=previous_note.midi_note,
+                startTime=previous_note.startTime,
+                duration=float(trimmed_previous_duration),
+                velocity=previous_note.velocity,
+            )
+            normalized_notes.append(note)
+            continue
+
+        normalized_notes[-1] = note
 
     return normalized_notes, overlap_fix_count
+
+
+def _should_drop_overlapping_note(previous_note: Note, note: Note) -> bool:
+    previous_end_time = previous_note.startTime + previous_note.duration
+    note_end_time = note.startTime + note.duration
+    if note_end_time > previous_end_time:
+        return False
+
+    overlap = _note_overlap_seconds(previous_note, note)
+    if overlap <= 0:
+        return False
+
+    overlap_ratio = overlap / note.duration
+    return (
+        overlap_ratio >= BASIC_PITCH_OVERLAP_RATIO_THRESHOLD
+        and _note_priority(previous_note) >= _note_priority(note)
+    )
 
 
 def _copy_note_with_midi(note: Note, midi_note: int) -> Note:
@@ -755,7 +994,7 @@ def _fit_scale(notes: list[Note]) -> ScaleFit:
     if not notes:
         raise AudioProcessingError("No notes available for scale fitting")
 
-    candidates: list[tuple[float, int, int, ScaleFit]] = []
+    candidates: list[tuple[float, int, int, int, ScaleFit]] = []
     note_pitch_classes = {note.midi_note % 12 for note in notes}
 
     for root in range(12):
@@ -772,6 +1011,7 @@ def _fit_scale(notes: list[Note]) -> ScaleFit:
                 1 for pitch_class in note_pitch_classes if pitch_class in scale_pitch_classes
             )
             tonic_present = 1 if root in note_pitch_classes else 0
+            anchor_score = _scale_anchor_score(notes, root, mode_name)
             confidence = _scale_confidence(notes, distance_score)
             scale_fit = ScaleFit(
                 name=f"{MIDI_NOTE_NAMES[root]}_{mode_name}",
@@ -779,12 +1019,43 @@ def _fit_scale(notes: list[Note]) -> ScaleFit:
                 scale_pitch_classes=scale_pitch_classes,
                 confidence=confidence,
             )
-            candidates.append((distance_score, -included_count, -tonic_present, scale_fit))
+            candidates.append((
+                distance_score,
+                -included_count,
+                -anchor_score,
+                -tonic_present,
+                scale_fit,
+            ))
 
     if not candidates:
         raise AudioProcessingError("Unable to fit scale")
 
-    return min(candidates, key=lambda candidate: candidate[:3])[3]
+    return min(candidates, key=lambda candidate: candidate[:4])[4]
+
+
+def _scale_anchor_score(notes: list[Note], root: int, mode_name: str) -> int:
+    first_degree = (notes[0].midi_note - root) % 12
+    last_degree = (notes[-1].midi_note - root) % 12
+    lowest_degree = (min(notes, key=lambda note: note.midi_note).midi_note - root) % 12
+    mode_third = 4 if mode_name == "MAJOR" else 3
+
+    return (
+        _terminal_scale_degree_score(first_degree, mode_third)
+        + _terminal_scale_degree_score(last_degree, mode_third)
+        + (2 if lowest_degree == 0 else 0)
+    )
+
+
+def _terminal_scale_degree_score(degree: int, mode_third: int) -> int:
+    if degree == 0:
+        return 4
+    if degree == 7:
+        return 3
+    if degree == mode_third:
+        return 2
+    if degree == 5:
+        return 1
+    return 0
 
 
 def _scale_confidence(notes: list[Note], distance_score: float) -> float:
@@ -804,7 +1075,19 @@ def _adjust_notes_to_scale(notes: list[Note], scale_fit: ScaleFit) -> list[Note]
     if not notes:
         raise AudioProcessingError("No notes available for scale adjustment")
 
-    return [_adjust_note_to_scale(note, scale_fit.scale_pitch_classes) for note in notes]
+    adjusted_notes = [
+        _adjust_note_to_scale(note, scale_fit.scale_pitch_classes)
+        for note in notes
+    ]
+    return _stabilize_scale_adjusted_notes(adjusted_notes)
+
+
+def _stabilize_scale_adjusted_notes(notes: list[Note]) -> list[Note]:
+    merged_notes, _ = _merge_adjacent_similar_notes(notes)
+    normalized_notes, _ = _remove_note_overlaps(merged_notes)
+    if not normalized_notes:
+        raise AudioProcessingError("No valid notes found after scale adjustment")
+    return normalized_notes
 
 
 def _adjust_note_to_scale(note: Note, scale_pitch_classes: frozenset[int]) -> Note:
@@ -847,13 +1130,13 @@ def _quantize_notes_with_metrics(notes: list[Note]) -> QuantizeResult:
 
     for note in ordered_notes:
         _validate_note_timing(note)
-        grid_start_time = _nearest_grid_time(note.startTime)
-        start_time = grid_start_time
+        candidate_start_time = _soft_quantized_start_time(note.startTime)
+        start_time = candidate_start_time
         if quantized_starts and start_time < quantized_starts[-1] + AUDIBLE_MIN_NOTE_SECONDS:
             collision_count += 1
             start_time = quantized_starts[-1] + AUDIBLE_MIN_NOTE_SECONDS
 
-        if start_time != grid_start_time:
+        if start_time != candidate_start_time:
             shifted_note_count += 1
 
         quantized_starts.append(start_time)
@@ -861,8 +1144,7 @@ def _quantize_notes_with_metrics(notes: list[Note]) -> QuantizeResult:
     quantized_notes: list[Note] = []
     overlap_fix_count = 0
     for index, note in enumerate(ordered_notes):
-        natural_duration = _note_span_until_next_boundary(note, ordered_notes, index)
-        duration = _nearest_rhythm_bucket(natural_duration)
+        duration = _quantized_note_duration(note)
         if index + 1 < len(quantized_starts):
             available_duration = quantized_starts[index + 1] - quantized_starts[index]
             if duration > available_duration:
@@ -901,21 +1183,18 @@ def _quantize_notes_with_metrics(notes: list[Note]) -> QuantizeResult:
     )
 
 
-def _note_span_until_next_boundary(
-    note: Note,
-    notes: list[Note],
-    index: int,
-) -> float:
-    note_end_time = note.startTime + note.duration
-    if index + 1 >= len(notes):
-        return note.duration
+def _quantized_note_duration(note: Note) -> float:
+    rhythm_bucket = _nearest_rhythm_bucket(note.duration)
+    if abs(rhythm_bucket - note.duration) <= QUANTIZE_DURATION_SNAP_TOLERANCE_SECONDS:
+        return rhythm_bucket
+    return note.duration
 
-    next_note = notes[index + 1]
-    next_boundary_duration = max(note.duration, next_note.startTime - note.startTime)
-    if next_note.startTime <= note_end_time:
-        return note.duration
 
-    return next_boundary_duration
+def _soft_quantized_start_time(start_time: float) -> float:
+    grid_start_time = _nearest_grid_time(start_time)
+    if abs(grid_start_time - start_time) <= QUANTIZE_ONSET_SNAP_TOLERANCE_SECONDS:
+        return grid_start_time
+    return start_time
 
 
 def _nearest_rhythm_bucket(duration_seconds: float) -> float:
@@ -949,26 +1228,40 @@ def _infer_chords(notes: list[Note], scale_fit: ScaleFit) -> list[Chord]:
     if not candidates:
         raise AudioProcessingError("No chord candidates available")
 
-    total_duration = max(note.startTime + note.duration for note in notes)
-    window_count = max(1, int(np.ceil(total_duration / CHORD_WINDOW_SECONDS)))
+    melody_start_time = min(note.startTime for note in notes)
+    melody_end_time = max(note.startTime + note.duration for note in notes)
+    melody_duration = melody_end_time - melody_start_time
+    window_count = _chord_window_count(melody_duration)
+    window_duration = melody_duration / window_count
     chords: list[Chord] = []
 
     for window_index in range(window_count):
-        start_time = window_index * CHORD_WINDOW_SECONDS
-        end_time = start_time + CHORD_WINDOW_SECONDS
+        start_time = melody_start_time + (window_index * window_duration)
+        end_time = (
+            melody_end_time
+            if window_index == window_count - 1
+            else start_time + window_duration
+        )
         window_notes = [
             note for note in notes if _note_overlaps_window(note, start_time, end_time)
         ]
         if not window_notes:
             continue
 
-        candidate = _select_chord_candidate(window_notes, candidates, mode)
+        candidate = _select_chord_candidate(
+            window_notes,
+            candidates,
+            mode,
+            start_time,
+            end_time,
+            window_index == 0,
+        )
         chords.append(
             Chord(
                 root=MIDI_NOTE_NAMES[candidate["root_pitch_class"]],
                 type=candidate["type"],
                 startTime=float(start_time),
-                duration=float(CHORD_WINDOW_SECONDS),
+                duration=float(end_time - start_time),
             )
         )
 
@@ -976,6 +1269,19 @@ def _infer_chords(notes: list[Note], scale_fit: ScaleFit) -> list[Chord]:
         raise AudioProcessingError("Unable to infer chords")
 
     return chords
+
+
+def _chord_window_count(melody_duration: float) -> int:
+    if melody_duration <= 0:
+        return 1
+    if melody_duration <= CHORD_WINDOW_SECONDS:
+        return 1
+    if melody_duration <= CHORD_SHORT_MELODY_MAX_SECONDS:
+        return min(
+            CHORD_SHORT_MELODY_MAX_WINDOWS,
+            max(2, int(np.ceil(melody_duration / CHORD_TARGET_SECTION_SECONDS))),
+        )
+    return max(1, int(np.ceil(melody_duration / CHORD_WINDOW_SECONDS)))
 
 
 def _scale_mode(scale_name: str) -> str:
@@ -1028,6 +1334,9 @@ def _select_chord_candidate(
     notes: list[Note],
     candidates: list[dict[str, object]],
     mode: str,
+    window_start_time: float,
+    window_end_time: float,
+    prefer_tonic: bool,
 ) -> dict[str, object]:
     tie_break_degrees = (
         MAJOR_CHORD_TIEBREAK_DEGREES if mode == "MAJOR" else MINOR_CHORD_TIEBREAK_DEGREES
@@ -1039,21 +1348,64 @@ def _select_chord_candidate(
     return max(
         candidates,
         key=lambda candidate: (
-            _chord_score(notes, candidate["pitch_classes"]),
+            _chord_score(notes, candidate, window_start_time, window_end_time)
+            + _initial_tonic_bonus(candidate, prefer_tonic),
             -degree_priority.get(candidate["degree"], len(tie_break_degrees)),
         ),
     )
 
 
-def _chord_score(notes: list[Note], chord_pitch_classes: object) -> float:
+def _initial_tonic_bonus(candidate: dict[str, object], prefer_tonic: bool) -> float:
+    if prefer_tonic and candidate["degree"] == 0:
+        return CHORD_INITIAL_TONIC_BONUS
+    return 0.0
+
+
+def _chord_score(
+    notes: list[Note],
+    candidate: dict[str, object],
+    window_start_time: float,
+    window_end_time: float,
+) -> float:
+    chord_pitch_classes = candidate["pitch_classes"]
+    root_pitch_class = candidate["root_pitch_class"]
     if not isinstance(chord_pitch_classes, frozenset):
         raise AudioProcessingError("Invalid chord candidate")
+    if not isinstance(root_pitch_class, int):
+        raise AudioProcessingError("Invalid chord candidate")
 
-    return sum(
-        note.duration
+    score = sum(
+        _note_window_overlap_duration(note, window_start_time, window_end_time)
         for note in notes
         if note.midi_note % 12 in chord_pitch_classes
     )
+
+    anchor_note = _window_anchor_note(notes, window_start_time)
+    if anchor_note.midi_note % 12 == root_pitch_class:
+        score += CHORD_WINDOW_ROOT_BONUS
+
+    return score
+
+
+def _window_anchor_note(notes: list[Note], window_start_time: float) -> Note:
+    onset_notes = [
+        note
+        for note in notes
+        if note.startTime >= window_start_time
+    ]
+    if onset_notes:
+        return min(onset_notes, key=lambda note: note.startTime)
+    return min(notes, key=lambda note: note.startTime)
+
+
+def _note_window_overlap_duration(
+    note: Note,
+    window_start_time: float,
+    window_end_time: float,
+) -> float:
+    start_time = max(note.startTime, window_start_time)
+    end_time = min(note.startTime + note.duration, window_end_time)
+    return max(0.0, end_time - start_time)
 
 
 def _note_overlaps_window(note: Note, start_time: float, end_time: float) -> bool:
@@ -1111,6 +1463,149 @@ def _write_midi_file(
     _log_midi_event_metrics(audio_id, melody_event_metrics)
     if ENABLE_ACCOMPANIMENT:
         _append_chord_events(chord_track, chords)
+
+    try:
+        midi_file.save(midi_path)
+    except Exception as exc:
+        raise AudioProcessingError(f"Unable to write MIDI file: {midi_path}") from exc
+
+    return midi_path
+
+
+def _write_debug_melody_midi_file(
+    audio_id: str,
+    output_directory: Path,
+    suffix: str,
+    melody_notes: list[Note],
+) -> Path:
+    if not audio_id or not audio_id.strip():
+        raise AudioProcessingError("audioId is required for MIDI generation")
+    if not suffix or not suffix.strip():
+        raise AudioProcessingError("MIDI suffix is required")
+    if not melody_notes:
+        raise AudioProcessingError("No melody notes available for MIDI generation")
+
+    try:
+        output_directory.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise AudioProcessingError(f"Unable to create output directory: {output_directory}") from exc
+
+    midi_path = output_directory / f"{audio_id}-{suffix}.mid"
+    midi_file = mido.MidiFile(ticks_per_beat=MIDI_TICKS_PER_BEAT)
+    tempo = mido.bpm2tempo(FALLBACK_TEMPO_BPM)
+    melody_track = mido.MidiTrack()
+    midi_file.tracks.append(melody_track)
+    melody_track.append(mido.MetaMessage("set_tempo", tempo=tempo, time=0))
+    melody_track.append(
+        mido.Message(
+            "program_change",
+            program=MIDI_PIANO_PROGRAM,
+            channel=MIDI_MELODY_CHANNEL,
+            time=0,
+        )
+    )
+    _append_note_events(melody_track, melody_notes, MIDI_MELODY_CHANNEL)
+
+    try:
+        midi_file.save(midi_path)
+    except Exception as exc:
+        raise AudioProcessingError(f"Unable to write MIDI file: {midi_path}") from exc
+
+    return midi_path
+
+
+def _write_debug_chord_midi_file(
+    audio_id: str,
+    output_directory: Path,
+    suffix: str,
+    chords: list[Chord],
+) -> Path:
+    if not audio_id or not audio_id.strip():
+        raise AudioProcessingError("audioId is required for MIDI generation")
+    if not suffix or not suffix.strip():
+        raise AudioProcessingError("MIDI suffix is required")
+    if not chords:
+        raise AudioProcessingError("No chords available for MIDI generation")
+
+    try:
+        output_directory.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise AudioProcessingError(f"Unable to create output directory: {output_directory}") from exc
+
+    midi_path = output_directory / f"{audio_id}-{suffix}.mid"
+    midi_file = mido.MidiFile(ticks_per_beat=MIDI_TICKS_PER_BEAT)
+    tempo = mido.bpm2tempo(FALLBACK_TEMPO_BPM)
+    chord_track = mido.MidiTrack()
+    midi_file.tracks.append(chord_track)
+    chord_track.append(mido.MetaMessage("set_tempo", tempo=tempo, time=0))
+    chord_track.append(
+        mido.Message(
+            "program_change",
+            program=MIDI_PIANO_PROGRAM,
+            channel=MIDI_CHORD_CHANNEL,
+            time=0,
+        )
+    )
+    _append_chord_events(chord_track, chords)
+
+    try:
+        midi_file.save(midi_path)
+    except Exception as exc:
+        raise AudioProcessingError(f"Unable to write MIDI file: {midi_path}") from exc
+
+    return midi_path
+
+
+def _write_debug_combined_midi_file(
+    audio_id: str,
+    output_directory: Path,
+    suffix: str,
+    melody_notes: list[Note],
+    chords: list[Chord],
+) -> Path:
+    if not audio_id or not audio_id.strip():
+        raise AudioProcessingError("audioId is required for MIDI generation")
+    if not suffix or not suffix.strip():
+        raise AudioProcessingError("MIDI suffix is required")
+    if not melody_notes:
+        raise AudioProcessingError("No melody notes available for MIDI generation")
+    if not chords:
+        raise AudioProcessingError("No chords available for MIDI generation")
+
+    try:
+        output_directory.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise AudioProcessingError(f"Unable to create output directory: {output_directory}") from exc
+
+    midi_path = output_directory / f"{audio_id}-{suffix}.mid"
+    midi_file = mido.MidiFile(ticks_per_beat=MIDI_TICKS_PER_BEAT)
+    tempo = mido.bpm2tempo(FALLBACK_TEMPO_BPM)
+
+    melody_track = mido.MidiTrack()
+    chord_track = mido.MidiTrack()
+    midi_file.tracks.append(melody_track)
+    midi_file.tracks.append(chord_track)
+
+    melody_track.append(mido.MetaMessage("set_tempo", tempo=tempo, time=0))
+    melody_track.append(
+        mido.Message(
+            "program_change",
+            program=MIDI_PIANO_PROGRAM,
+            channel=MIDI_MELODY_CHANNEL,
+            time=0,
+        )
+    )
+    chord_track.append(
+        mido.Message(
+            "program_change",
+            program=MIDI_PIANO_PROGRAM,
+            channel=MIDI_CHORD_CHANNEL,
+            time=0,
+        )
+    )
+
+    _append_note_events(melody_track, melody_notes, MIDI_MELODY_CHANNEL)
+    _append_chord_events(chord_track, chords)
 
     try:
         midi_file.save(midi_path)
