@@ -16,14 +16,32 @@ MIN_PITCH_FRAMES = 3
 MIN_VOICED_PROBABILITY = 0.5
 MIN_PITCH_HZ = librosa.note_to_hz("C2")
 MAX_PITCH_HZ = librosa.note_to_hz("C7")
-MIN_NOTE_DURATION_SECONDS = 0.1
+PITCH_FRAME_GAP_BOUNDARY_SECONDS = (PITCH_HOP_LENGTH / TARGET_SAMPLE_RATE) * 2.5
+PITCH_SEGMENT_TOLERANCE_SEMITONES = 0
+MIN_NOTE_DURATION_SECONDS = 0.08
+RECOVERABLE_SHORT_SEGMENT_MIN_SECONDS = (PITCH_HOP_LENGTH / TARGET_SAMPLE_RATE) * 2.0
+RECOVERABLE_SHORT_SEGMENT_MIN_CONFIDENCE = 0.57
+JITTER_SEGMENT_MAX_SECONDS = 0.12
+JITTER_MAX_SEMITONES = 1
 NOTE_MERGE_TOLERANCE_SEMITONES = 1
+NOTE_CLEANUP_MIN_DURATION_SECONDS = 0.08
+NOTE_CLEANUP_MERGE_GAP_SECONDS = 0.04
+NOTE_CLEANUP_SPIKE_MAX_DURATION_SECONDS = 0.18
 DEFAULT_NOTE_VELOCITY = 80
 MIDI_NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 MAJOR_SCALE_INTERVALS = (0, 2, 4, 5, 7, 9, 11)
 MINOR_SCALE_INTERVALS = (0, 2, 3, 5, 7, 8, 10)
 FALLBACK_TEMPO_BPM = 100
 QUANTIZE_GRID_SECONDS = (60.0 / FALLBACK_TEMPO_BPM) / 2.0
+INTERNAL_REPEAT_SPLIT_MIN_SECONDS = QUANTIZE_GRID_SECONDS * 2.5
+INTERNAL_REPEAT_TARGET_SECONDS = QUANTIZE_GRID_SECONDS
+RHYTHM_BUCKET_SECONDS = (
+    QUANTIZE_GRID_SECONDS / 2.0,
+    QUANTIZE_GRID_SECONDS,
+    QUANTIZE_GRID_SECONDS * 2.0,
+    QUANTIZE_GRID_SECONDS * 4.0,
+)
+AUDIBLE_MIN_NOTE_SECONDS = RHYTHM_BUCKET_SECONDS[0]
 CHORD_WINDOW_SECONDS = 4 * (60.0 / FALLBACK_TEMPO_BPM)
 MAJOR_CHORD_TIEBREAK_DEGREES = (0, 3, 4, 5, 1, 2, 6)
 MINOR_CHORD_TIEBREAK_DEGREES = (0, 3, 4, 5, 6, 2, 1)
@@ -33,6 +51,11 @@ MIDI_CHORD_CHANNEL = 1
 MIDI_PIANO_PROGRAM = 0
 MIDI_CHORD_VELOCITY = 64
 CHORD_BASE_OCTAVE_MIDI = 48
+ENABLE_ACCOMPANIMENT = False
+MIDI_BAR_BEATS = 4
+MIDI_RELEASE_GAP_TICKS = 24
+MIDI_MIN_NOTE_TICKS = 60
+MIDI_HALF_BEAT_TICKS = MIDI_TICKS_PER_BEAT // 2
 PREVIEW_SAMPLE_RATE = 22050
 PREVIEW_BASE_AMPLITUDE = 0.18
 PREVIEW_ATTACK_SECONDS = 0.005
@@ -49,6 +72,8 @@ class PitchFrame:
     timestamp_seconds: float
     frequency_hz: float
     confidence: float
+    onset_strength: float = 0.0
+    rms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -95,6 +120,35 @@ class LoadedAudio:
     previewAudioPath: str | None
 
 
+@dataclass(frozen=True)
+class NoteCleanupResult:
+    notes: list[Note]
+    raw_note_count: int
+    cleaned_note_count: int
+    dropped_short_note_count: int
+    merged_note_count: int
+    overlap_fix_count: int
+
+
+@dataclass(frozen=True)
+class QuantizeResult:
+    notes: list[Note]
+    before_note_count: int
+    after_note_count: int
+    audible_note_count: int
+    too_short_after_quantization_count: int
+    min_duration_after_quantization: float
+    collision_count: int
+    shifted_note_count: int
+    overlap_fix_count: int
+
+
+@dataclass(frozen=True)
+class MidiEventMetrics:
+    midi_event_count: int
+    zero_or_negative_delta_count: int
+
+
 class PreviewNote(NamedTuple):
     midi_note: int
     velocity: int
@@ -113,9 +167,25 @@ def analyze_audio(
     duration_seconds = _validate_loaded_audio(samples, sample_rate)
     pitch_frames = _detect_pitch_frames(samples, sample_rate)
     original_notes = _pitch_frames_to_notes(pitch_frames)
-    scale_fit = _fit_scale(original_notes)
-    adjusted_notes = _adjust_notes_to_scale(original_notes, scale_fit)
-    quantized_notes = _quantize_notes(adjusted_notes)
+    cleanup_result = _cleanup_notes_with_metrics(original_notes)
+    _log_note_cleanup_metrics(audio_id, cleanup_result)
+    cleaned_notes = cleanup_result.notes
+    scale_fit = _fit_scale(cleaned_notes)
+    adjusted_notes = _adjust_notes_to_scale(cleaned_notes, scale_fit)
+    quantize_result = _quantize_notes_with_metrics(adjusted_notes)
+    quantized_notes = quantize_result.notes
+    _log_note_pipeline_counts(
+        audio_id=audio_id,
+        pitch_frame_count=len(pitch_frames),
+        raw_note_count=len(original_notes),
+        cleaned_note_count=len(cleaned_notes),
+        adjusted_note_count=len(adjusted_notes),
+        quantized_note_count=len(quantized_notes),
+        dropped_note_count=cleanup_result.dropped_short_note_count,
+        merged_note_count=cleanup_result.merged_note_count,
+    )
+    _log_quantization_metrics(audio_id, quantize_result)
+    _log_quantized_duration_stats(audio_id, quantized_notes)
     chords = _infer_chords(quantized_notes, scale_fit)
     midi_path = _write_midi_file(audio_id, output_path, quantized_notes, chords)
     preview_audio_path = _try_write_wav_preview_file(audio_id, output_path, midi_path)
@@ -206,14 +276,24 @@ def _detect_pitch_frames(samples: np.ndarray, sample_rate: int) -> list[PitchFra
         sr=sample_rate,
         hop_length=PITCH_HOP_LENGTH,
     )
+    onset_strengths = librosa.onset.onset_strength(
+        y=samples,
+        sr=sample_rate,
+        hop_length=PITCH_HOP_LENGTH,
+    )
+    rms_values = librosa.feature.rms(
+        y=samples,
+        frame_length=PITCH_FRAME_LENGTH,
+        hop_length=PITCH_HOP_LENGTH,
+    )[0]
 
     pitch_frames: list[PitchFrame] = []
-    for timestamp, frequency, is_voiced, voiced_probability in zip(
+    for frame_index, (timestamp, frequency, is_voiced, voiced_probability) in enumerate(zip(
         frame_times,
         frequencies,
         voiced_flags,
         voiced_probabilities,
-    ):
+    )):
         confidence = float(voiced_probability) if np.isfinite(voiced_probability) else 0.0
         if not is_voiced:
             continue
@@ -227,6 +307,12 @@ def _detect_pitch_frames(samples: np.ndarray, sample_rate: int) -> list[PitchFra
                 timestamp_seconds=float(timestamp),
                 frequency_hz=float(frequency),
                 confidence=confidence,
+                onset_strength=(
+                    float(onset_strengths[frame_index])
+                    if frame_index < len(onset_strengths)
+                    else 0.0
+                ),
+                rms=float(rms_values[frame_index]) if frame_index < len(rms_values) else 0.0,
             )
         )
 
@@ -242,27 +328,155 @@ def _pitch_frames_to_notes(pitch_frames: list[PitchFrame]) -> list[Note]:
 
     notes: list[Note] = []
     current_midi = _frequency_to_midi_note(pitch_frames[0].frequency_hz)
-    current_start = pitch_frames[0].timestamp_seconds
+    current_segment_frames = [pitch_frames[0]]
     last_timestamp = pitch_frames[0].timestamp_seconds
 
-    for frame in pitch_frames[1:]:
+    index = 1
+    while index < len(pitch_frames):
+        frame = pitch_frames[index]
         frame_midi = _frequency_to_midi_note(frame.frequency_hz)
-        if abs(frame_midi - current_midi) <= NOTE_MERGE_TOLERANCE_SEMITONES:
-            current_midi = round((current_midi + frame_midi) / 2)
+        frame_gap = frame.timestamp_seconds - last_timestamp
+        should_continue_note = (
+            frame_gap <= PITCH_FRAME_GAP_BOUNDARY_SECONDS
+            and abs(frame_midi - current_midi) <= PITCH_SEGMENT_TOLERANCE_SEMITONES
+        )
+        if should_continue_note:
+            current_segment_frames.append(frame)
             last_timestamp = frame.timestamp_seconds
+            index += 1
             continue
 
-        _append_note_if_long_enough(notes, current_midi, current_start, last_timestamp)
-        current_midi = frame_midi
-        current_start = frame.timestamp_seconds
-        last_timestamp = frame.timestamp_seconds
+        jitter_frames, next_index = _collect_jitter_return_frames(
+            pitch_frames,
+            index,
+            current_midi,
+        )
+        if jitter_frames:
+            current_segment_frames.extend(jitter_frames)
+            last_timestamp = jitter_frames[-1].timestamp_seconds
+            index = next_index
+            continue
 
-    _append_note_if_long_enough(notes, current_midi, current_start, last_timestamp)
+        _append_note_segment(notes, current_midi, current_segment_frames)
+        current_midi = frame_midi
+        current_segment_frames = [frame]
+        last_timestamp = frame.timestamp_seconds
+        index += 1
+
+    _append_note_segment(notes, current_midi, current_segment_frames)
 
     if not notes:
         raise AudioProcessingError("No valid notes found")
 
     return notes
+
+
+def _collect_jitter_return_frames(
+    pitch_frames: list[PitchFrame],
+    start_index: int,
+    current_midi: int,
+) -> tuple[list[PitchFrame], int]:
+    first_midi = _frequency_to_midi_note(pitch_frames[start_index].frequency_hz)
+    if first_midi == current_midi:
+        return [], start_index
+
+    jitter_frames: list[PitchFrame] = []
+    index = start_index
+
+    while index < len(pitch_frames):
+        frame = pitch_frames[index]
+        frame_midi = _frequency_to_midi_note(frame.frequency_hz)
+        if abs(frame_midi - current_midi) > JITTER_MAX_SEMITONES:
+            break
+        if frame_midi == current_midi:
+            jitter_frames.append(frame)
+            return jitter_frames, index + 1
+
+        jitter_frames.append(frame)
+        duration = (
+            jitter_frames[-1].timestamp_seconds
+            - jitter_frames[0].timestamp_seconds
+            + (PITCH_HOP_LENGTH / TARGET_SAMPLE_RATE)
+        )
+        if duration > JITTER_SEGMENT_MAX_SECONDS:
+            return [], start_index
+
+        index += 1
+
+    return [], start_index
+
+
+def _append_note_segment(
+    notes: list[Note],
+    midi_note: int,
+    segment_frames: list[PitchFrame],
+) -> None:
+    before_count = len(notes)
+    for start_time, end_time in _split_repeated_note_segment(segment_frames):
+        _append_note_if_long_enough(notes, midi_note, start_time, end_time)
+    if len(notes) == before_count:
+        _append_recoverable_short_note_segment(notes, midi_note, segment_frames)
+
+
+def _append_recoverable_short_note_segment(
+    notes: list[Note],
+    midi_note: int,
+    segment_frames: list[PitchFrame],
+) -> None:
+    if not _is_recoverable_short_note_segment(segment_frames):
+        return
+
+    notes.append(
+        Note(
+            pitch=_midi_note_to_name(midi_note),
+            midi_note=midi_note,
+            startTime=float(segment_frames[0].timestamp_seconds),
+            duration=float(MIN_NOTE_DURATION_SECONDS),
+            velocity=DEFAULT_NOTE_VELOCITY,
+        )
+    )
+
+
+def _is_recoverable_short_note_segment(segment_frames: list[PitchFrame]) -> bool:
+    if len(segment_frames) < 2:
+        return False
+
+    duration = (
+        segment_frames[-1].timestamp_seconds
+        - segment_frames[0].timestamp_seconds
+        + (PITCH_HOP_LENGTH / TARGET_SAMPLE_RATE)
+    )
+    if duration < RECOVERABLE_SHORT_SEGMENT_MIN_SECONDS:
+        return False
+    if duration >= MIN_NOTE_DURATION_SECONDS:
+        return False
+
+    average_confidence = sum(frame.confidence for frame in segment_frames) / len(segment_frames)
+    return average_confidence >= RECOVERABLE_SHORT_SEGMENT_MIN_CONFIDENCE
+
+
+def _split_repeated_note_segment(segment_frames: list[PitchFrame]) -> list[tuple[float, float]]:
+    if not segment_frames:
+        return []
+
+    start_time = segment_frames[0].timestamp_seconds
+    end_time = segment_frames[-1].timestamp_seconds
+    duration = end_time - start_time + (PITCH_HOP_LENGTH / TARGET_SAMPLE_RATE)
+    if duration < INTERNAL_REPEAT_SPLIT_MIN_SECONDS:
+        return [(start_time, end_time)]
+
+    split_count = max(1, int(round(duration / INTERNAL_REPEAT_TARGET_SECONDS)))
+    if split_count <= 1:
+        return [(start_time, end_time)]
+
+    split_duration = duration / split_count
+    split_segments: list[tuple[float, float]] = []
+    for index in range(split_count):
+        split_start = start_time + (index * split_duration)
+        split_end = split_start + split_duration - (PITCH_HOP_LENGTH / TARGET_SAMPLE_RATE)
+        split_segments.append((split_start, max(split_start, split_end)))
+
+    return split_segments
 
 
 def _append_note_if_long_enough(
@@ -283,6 +497,244 @@ def _append_note_if_long_enough(
             duration=float(duration),
             velocity=DEFAULT_NOTE_VELOCITY,
         )
+    )
+
+
+def _cleanup_notes(notes: list[Note]) -> list[Note]:
+    return _cleanup_notes_with_metrics(notes).notes
+
+
+def _cleanup_notes_with_metrics(notes: list[Note]) -> NoteCleanupResult:
+    if not notes:
+        raise AudioProcessingError("No notes available for cleanup")
+
+    ordered_notes = sorted(notes, key=lambda note: (note.startTime, note.midi_note))
+    smoothed_notes = _smooth_isolated_pitch_spikes(ordered_notes)
+    merged_notes, merged_note_count = _merge_adjacent_similar_notes(smoothed_notes)
+    cleaned_notes = _drop_short_notes(merged_notes)
+    dropped_short_note_count = len(merged_notes) - len(cleaned_notes)
+
+    if not cleaned_notes:
+        raise AudioProcessingError("No valid notes found after cleanup")
+
+    normalized_notes, overlap_fix_count = _remove_note_overlaps(cleaned_notes)
+    if not normalized_notes:
+        raise AudioProcessingError("No valid notes found after cleanup")
+
+    return NoteCleanupResult(
+        notes=normalized_notes,
+        raw_note_count=len(notes),
+        cleaned_note_count=len(normalized_notes),
+        dropped_short_note_count=dropped_short_note_count,
+        merged_note_count=merged_note_count,
+        overlap_fix_count=overlap_fix_count,
+    )
+
+
+def _log_note_cleanup_metrics(audio_id: str, cleanup_result: NoteCleanupResult) -> None:
+    print(
+        "note_cleanup_metrics "
+        f"audio_id={audio_id} "
+        f"raw_note_count={cleanup_result.raw_note_count} "
+        f"cleaned_note_count={cleanup_result.cleaned_note_count} "
+        f"dropped_short_note_count={cleanup_result.dropped_short_note_count} "
+        f"merged_note_count={cleanup_result.merged_note_count} "
+        f"overlap_fix_count={cleanup_result.overlap_fix_count}",
+        flush=True,
+    )
+
+
+def _log_note_pipeline_counts(
+    audio_id: str,
+    pitch_frame_count: int,
+    raw_note_count: int,
+    cleaned_note_count: int,
+    adjusted_note_count: int,
+    quantized_note_count: int,
+    dropped_note_count: int,
+    merged_note_count: int,
+) -> None:
+    print(
+        "note_pipeline_counts "
+        f"audio_id={audio_id} "
+        f"pitch_frame_count={pitch_frame_count} "
+        f"raw_note_count={raw_note_count} "
+        f"cleaned_note_count={cleaned_note_count} "
+        f"adjusted_note_count={adjusted_note_count} "
+        f"quantized_note_count={quantized_note_count} "
+        f"dropped_note_count={dropped_note_count} "
+        f"merged_note_count={merged_note_count}",
+        flush=True,
+    )
+
+
+def _log_quantized_duration_stats(audio_id: str, notes: list[Note]) -> None:
+    durations = [note.duration for note in notes]
+    if not durations:
+        return
+
+    print(
+        "quantized_duration_stats "
+        f"audio_id={audio_id} "
+        f"min_duration={min(durations):.3f} "
+        f"max_duration={max(durations):.3f} "
+        f"avg_duration={(sum(durations) / len(durations)):.3f}",
+        flush=True,
+    )
+
+
+def _log_quantization_metrics(audio_id: str, quantize_result: QuantizeResult) -> None:
+    print(
+        "quantization_metrics "
+        f"audio_id={audio_id} "
+        f"before_note_count={quantize_result.before_note_count} "
+        f"after_note_count={quantize_result.after_note_count} "
+        f"audible_note_count={quantize_result.audible_note_count} "
+        f"too_short_after_quantization_count={quantize_result.too_short_after_quantization_count} "
+        f"min_duration_after_quantization={quantize_result.min_duration_after_quantization:.3f} "
+        f"collision_count={quantize_result.collision_count} "
+        f"shifted_note_count={quantize_result.shifted_note_count} "
+        f"overlap_fix_count={quantize_result.overlap_fix_count}",
+        flush=True,
+    )
+
+
+def _log_midi_event_metrics(audio_id: str, metrics: MidiEventMetrics) -> None:
+    print(
+        "midi_event_metrics "
+        f"audio_id={audio_id} "
+        f"midi_event_count={metrics.midi_event_count} "
+        f"zero_or_negative_delta_count={metrics.zero_or_negative_delta_count}",
+        flush=True,
+    )
+
+
+def _smooth_isolated_pitch_spikes(notes: list[Note]) -> list[Note]:
+    if len(notes) < 3:
+        return notes
+
+    smoothed_notes = list(notes)
+    for index in range(1, len(notes) - 1):
+        previous_note = notes[index - 1]
+        note = notes[index]
+        next_note = notes[index + 1]
+
+        if note.duration > NOTE_CLEANUP_SPIKE_MAX_DURATION_SECONDS:
+            continue
+        if abs(previous_note.midi_note - next_note.midi_note) > NOTE_MERGE_TOLERANCE_SEMITONES:
+            continue
+        if abs(note.midi_note - previous_note.midi_note) <= NOTE_MERGE_TOLERANCE_SEMITONES:
+            continue
+        if abs(note.midi_note - next_note.midi_note) <= NOTE_MERGE_TOLERANCE_SEMITONES:
+            continue
+
+        target_midi_note = round((previous_note.midi_note + next_note.midi_note) / 2)
+        smoothed_notes[index] = _copy_note_with_midi(note, target_midi_note)
+
+    return smoothed_notes
+
+
+def _merge_adjacent_similar_notes(notes: list[Note]) -> tuple[list[Note], int]:
+    merged_notes: list[Note] = []
+    merged_note_count = 0
+
+    for note in notes:
+        _validate_note_timing(note)
+        if not merged_notes:
+            merged_notes.append(note)
+            continue
+
+        previous_note = merged_notes[-1]
+        gap_seconds = note.startTime - (previous_note.startTime + previous_note.duration)
+        if not _should_merge_adjacent_notes(previous_note, note, gap_seconds):
+            merged_notes.append(note)
+            continue
+
+        merged_notes[-1] = _merge_notes(previous_note, note)
+        merged_note_count += 1
+
+    return merged_notes, merged_note_count
+
+
+def _should_merge_adjacent_notes(
+    previous_note: Note,
+    note: Note,
+    gap_seconds: float,
+) -> bool:
+    if gap_seconds < 0:
+        return previous_note.midi_note == note.midi_note
+    if gap_seconds > NOTE_CLEANUP_MERGE_GAP_SECONDS:
+        return False
+
+    return previous_note.midi_note == note.midi_note
+
+
+def _merge_notes(first_note: Note, second_note: Note) -> Note:
+    start_time = min(first_note.startTime, second_note.startTime)
+    end_time = max(
+        first_note.startTime + first_note.duration,
+        second_note.startTime + second_note.duration,
+    )
+    total_duration = first_note.duration + second_note.duration
+    weighted_midi_note = round(
+        (
+            (first_note.midi_note * first_note.duration)
+            + (second_note.midi_note * second_note.duration)
+        )
+        / total_duration
+    )
+
+    return Note(
+        pitch=_midi_note_to_name(weighted_midi_note),
+        midi_note=weighted_midi_note,
+        startTime=float(start_time),
+        duration=float(end_time - start_time),
+        velocity=max(first_note.velocity, second_note.velocity),
+    )
+
+
+def _drop_short_notes(notes: list[Note]) -> list[Note]:
+    return [
+        note
+        for note in notes
+        if note.duration >= NOTE_CLEANUP_MIN_DURATION_SECONDS
+    ]
+
+
+def _remove_note_overlaps(notes: list[Note]) -> tuple[list[Note], int]:
+    normalized_notes: list[Note] = []
+    previous_end_time = 0.0
+    overlap_fix_count = 0
+
+    for note in notes:
+        start_time = max(note.startTime, previous_end_time)
+        if start_time > note.startTime:
+            overlap_fix_count += 1
+        end_time = max(start_time, note.startTime + note.duration)
+        duration = end_time - start_time
+        if duration < NOTE_CLEANUP_MIN_DURATION_SECONDS:
+            continue
+
+        normalized_note = Note(
+            pitch=note.pitch,
+            midi_note=note.midi_note,
+            startTime=float(start_time),
+            duration=float(duration),
+            velocity=note.velocity,
+        )
+        normalized_notes.append(normalized_note)
+        previous_end_time = start_time + duration
+
+    return normalized_notes, overlap_fix_count
+
+
+def _copy_note_with_midi(note: Note, midi_note: int) -> Note:
+    return Note(
+        pitch=_midi_note_to_name(midi_note),
+        midi_note=midi_note,
+        startTime=note.startTime,
+        duration=note.duration,
+        velocity=note.velocity,
     )
 
 
@@ -381,35 +833,99 @@ def _nearest_scale_midi_note(midi_note: int, scale_pitch_classes: frozenset[int]
 
 
 def _quantize_notes(notes: list[Note]) -> list[Note]:
+    return _quantize_notes_with_metrics(notes).notes
+
+
+def _quantize_notes_with_metrics(notes: list[Note]) -> QuantizeResult:
     if not notes:
         raise AudioProcessingError("No notes available for quantization")
 
-    quantized_notes: list[Note] = []
-    previous_end_time = 0.0
+    ordered_notes = sorted(notes, key=lambda note: (note.startTime, note.midi_note))
+    quantized_starts: list[float] = []
+    collision_count = 0
+    shifted_note_count = 0
 
-    for note in notes:
+    for note in ordered_notes:
         _validate_note_timing(note)
-        start_time = _nearest_grid_time(note.startTime)
-        duration = max(_nearest_grid_time(note.duration), QUANTIZE_GRID_SECONDS)
+        grid_start_time = _nearest_grid_time(note.startTime)
+        start_time = grid_start_time
+        if quantized_starts and start_time < quantized_starts[-1] + AUDIBLE_MIN_NOTE_SECONDS:
+            collision_count += 1
+            start_time = quantized_starts[-1] + AUDIBLE_MIN_NOTE_SECONDS
 
-        if start_time < previous_end_time:
-            start_time = previous_end_time
+        if start_time != grid_start_time:
+            shifted_note_count += 1
+
+        quantized_starts.append(start_time)
+
+    quantized_notes: list[Note] = []
+    overlap_fix_count = 0
+    for index, note in enumerate(ordered_notes):
+        natural_duration = _note_span_until_next_boundary(note, ordered_notes, index)
+        duration = _nearest_rhythm_bucket(natural_duration)
+        if index + 1 < len(quantized_starts):
+            available_duration = quantized_starts[index + 1] - quantized_starts[index]
+            if duration > available_duration:
+                duration = available_duration
+                overlap_fix_count += 1
+        duration = max(AUDIBLE_MIN_NOTE_SECONDS, duration)
 
         quantized_notes.append(
             Note(
                 pitch=note.pitch,
                 midi_note=note.midi_note,
-                startTime=float(start_time),
+                startTime=float(quantized_starts[index]),
                 duration=float(duration),
                 velocity=note.velocity,
             )
         )
-        previous_end_time = start_time + duration
 
     if not quantized_notes:
         raise AudioProcessingError("Unable to quantize notes")
 
-    return quantized_notes
+    too_short_after_quantization_count = sum(
+        1 for note in quantized_notes if note.duration < AUDIBLE_MIN_NOTE_SECONDS
+    )
+    min_duration_after_quantization = min(note.duration for note in quantized_notes)
+
+    return QuantizeResult(
+        notes=quantized_notes,
+        before_note_count=len(notes),
+        after_note_count=len(quantized_notes),
+        audible_note_count=len(quantized_notes) - too_short_after_quantization_count,
+        too_short_after_quantization_count=too_short_after_quantization_count,
+        min_duration_after_quantization=float(min_duration_after_quantization),
+        collision_count=collision_count,
+        shifted_note_count=shifted_note_count,
+        overlap_fix_count=overlap_fix_count,
+    )
+
+
+def _note_span_until_next_boundary(
+    note: Note,
+    notes: list[Note],
+    index: int,
+) -> float:
+    note_end_time = note.startTime + note.duration
+    if index + 1 >= len(notes):
+        return note.duration
+
+    next_note = notes[index + 1]
+    next_boundary_duration = max(note.duration, next_note.startTime - note.startTime)
+    if next_note.startTime <= note_end_time:
+        return note.duration
+
+    return next_boundary_duration
+
+
+def _nearest_rhythm_bucket(duration_seconds: float) -> float:
+    if not np.isfinite(duration_seconds) or duration_seconds <= 0:
+        raise AudioProcessingError("Invalid note duration")
+
+    return min(
+        RHYTHM_BUCKET_SECONDS,
+        key=lambda bucket: (abs(bucket - duration_seconds), bucket),
+    )
 
 
 def _nearest_grid_time(value_seconds: float) -> float:
@@ -591,8 +1107,10 @@ def _write_midi_file(
         )
     )
 
-    _append_note_events(melody_track, melody_notes, MIDI_MELODY_CHANNEL)
-    _append_chord_events(chord_track, chords)
+    melody_event_metrics = _append_note_events(melody_track, melody_notes, MIDI_MELODY_CHANNEL)
+    _log_midi_event_metrics(audio_id, melody_event_metrics)
+    if ENABLE_ACCOMPANIMENT:
+        _append_chord_events(chord_track, chords)
 
     try:
         midi_file.save(midi_path)
@@ -736,23 +1254,39 @@ def _append_note_events(
     track: mido.MidiTrack,
     notes: list[Note],
     channel: int,
-) -> None:
+) -> MidiEventMetrics:
     current_tick = 0
-    for note in notes:
+    zero_or_negative_delta_count = 0
+    midi_event_count = 0
+    ordered_notes = sorted(notes, key=lambda note: (note.startTime, note.midi_note))
+    for index, note in enumerate(ordered_notes):
         _validate_note_timing(note)
         start_tick = _seconds_to_ticks(note.startTime)
-        duration_ticks = max(1, _seconds_to_ticks(note.duration))
-        delta_start = max(0, start_tick - current_tick)
+        next_start_tick = (
+            _seconds_to_ticks(ordered_notes[index + 1].startTime)
+            if index + 1 < len(ordered_notes)
+            else None
+        )
+        duration_ticks = _melody_duration_ticks(
+            start_tick,
+            _seconds_to_ticks(note.duration),
+            next_start_tick,
+        )
+        raw_delta_start = start_tick - current_tick
+        if raw_delta_start < 0 or duration_ticks <= 0:
+            zero_or_negative_delta_count += 1
+        delta_start = max(0, raw_delta_start)
 
         track.append(
             mido.Message(
                 "note_on",
                 note=note.midi_note,
-                velocity=note.velocity,
+                velocity=_melody_velocity(note.velocity, start_tick),
                 channel=channel,
                 time=delta_start,
             )
         )
+        midi_event_count += 1
         track.append(
             mido.Message(
                 "note_off",
@@ -762,14 +1296,20 @@ def _append_note_events(
                 time=duration_ticks,
             )
         )
+        midi_event_count += 1
         current_tick = start_tick + duration_ticks
+
+    return MidiEventMetrics(
+        midi_event_count=midi_event_count,
+        zero_or_negative_delta_count=zero_or_negative_delta_count,
+    )
 
 
 def _append_chord_events(track: mido.MidiTrack, chords: list[Chord]) -> None:
     current_tick = 0
     for chord in chords:
         start_tick = _seconds_to_ticks(chord.startTime)
-        duration_ticks = max(1, _seconds_to_ticks(chord.duration))
+        duration_ticks = max(MIDI_MIN_NOTE_TICKS, _seconds_to_ticks(chord.duration))
         chord_notes = _chord_to_midi_notes(chord)
         delta_start = max(0, start_tick - current_tick)
 
@@ -796,6 +1336,41 @@ def _append_chord_events(track: mido.MidiTrack, chords: list[Chord]) -> None:
             )
 
         current_tick = start_tick + duration_ticks
+
+
+def _melody_duration_ticks(
+    start_tick: int,
+    duration_ticks: int,
+    next_start_tick: int | None,
+) -> int:
+    playable_duration_ticks = max(MIDI_MIN_NOTE_TICKS, duration_ticks)
+    if next_start_tick is None or next_start_tick <= start_tick:
+        return playable_duration_ticks
+
+    available_ticks = max(
+        MIDI_MIN_NOTE_TICKS,
+        next_start_tick - start_tick - MIDI_RELEASE_GAP_TICKS,
+    )
+    return min(playable_duration_ticks, available_ticks)
+
+
+def _melody_velocity(base_velocity: int, start_tick: int) -> int:
+    bar_ticks = MIDI_TICKS_PER_BEAT * MIDI_BAR_BEATS
+    beat_position = start_tick % bar_ticks
+    if beat_position == 0:
+        accent = 10
+    elif beat_position % MIDI_TICKS_PER_BEAT == 0:
+        accent = 5
+    elif beat_position % MIDI_HALF_BEAT_TICKS == 0:
+        accent = 1
+    else:
+        accent = -3
+
+    return _clamp_midi_velocity(base_velocity + accent)
+
+
+def _clamp_midi_velocity(velocity: int) -> int:
+    return max(1, min(127, velocity))
 
 
 def _chord_to_midi_notes(chord: Chord) -> list[int]:
