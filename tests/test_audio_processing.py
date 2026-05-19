@@ -23,6 +23,7 @@ from app.audio_processing import _frequency_to_midi_note
 from app.audio_processing import _infer_chords
 from app.audio_processing import _write_debug_chord_midi_file
 from app.audio_processing import _write_debug_combined_midi_file
+from app.audio_processing import _write_midi_file
 from app.audio_processing import _midi_note_to_name
 from app.audio_processing import _pitch_frames_to_notes
 from app.audio_processing import _quantize_notes
@@ -697,6 +698,23 @@ def test_debug_chord_outputs_make_accompaniment_audible(tmp_path: Path) -> None:
     }
     assert all(message.channel == MIDI_CHORD_CHANNEL for message in chord_note_ons)
     assert combined_channels == {MIDI_MELODY_CHANNEL, MIDI_CHORD_CHANNEL}
+
+
+def test_main_product_midi_includes_final_melody_and_chords(tmp_path: Path) -> None:
+    notes = [_note(60, 0.0, 0.3), _note(64, 0.3, 0.3)]
+    chords = [Chord(root="C", type="MAJOR", startTime=0.0, duration=1.2)]
+
+    midi_path = _write_midi_file("sample", tmp_path, notes, chords)
+
+    assert midi_path == tmp_path / "sample.mid"
+    midi = mido.MidiFile(midi_path)
+    channels = {
+        message.channel
+        for track in midi.tracks
+        for message in track
+        if message.type == "note_on"
+    }
+    assert channels == {MIDI_MELODY_CHANNEL, MIDI_CHORD_CHANNEL}
 
 
 def _note(midi_note: int, start_time: float, duration: float) -> Note:
