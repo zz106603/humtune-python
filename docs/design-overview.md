@@ -305,17 +305,33 @@ POST /internal/audio/analyze
 성공:
 
 - status: COMPLETED
-- noteEvents
 - detectedScale
+- keyConfidence
+- originalNotes
 - adjustedNotes
 - chords
 - midiPath
 - previewAudioPath
+- processingTimeMs
 
 실패:
 
 - status: FAILED
 - errorMessage
+
+성공 응답 필드의 의미:
+
+- detectedScale: 최종 scale fitting 결과. 이후 scale adjustment, quantization, chord inference에 사용된 scale 이름
+- keyConfidence: 선택된 detectedScale에 대한 deterministic confidence score
+- originalNotes: Basic Pitch raw note event에서 추출한 원본 note name sequence. 사용자 표시용 최종 melody가 아니라 진단 및 호환용 필드
+- adjustedNotes: legacy-compatible field name. API가 노출하는 최종 melody note name sequence이며 cleanup, scale adjustment, quantization이 모두 적용된 melody이다. midiPath의 melody track과 의미적으로 일치해야 한다
+- chords: 최종 chord inference 결과의 chord label sequence만 노출한다. chord startTime/duration은 API 응답에 포함하지 않는다
+- midiPath: 서비스의 main product MIDI. 최종 melody와 timing-normalized inferred chord/accompaniment를 포함한다
+- previewAudioPath: midiPath에서 렌더링한 선택적 WAV preview 경로. preview 생성이 실패하면 생략될 수 있다
+- processingTimeMs: Python 분석 처리 시간
+
+API 응답에는 raw/cleaned/scale-adjusted-before-quantization/final melody 전체를 모두 노출하지 않는다.  
+raw, cleaned, adjusted, final melody, chord-only, combined MIDI 비교 산출물은 manual/debug artifact로만 유지한다.
 
 ---
 
@@ -339,7 +355,6 @@ POST /internal/audio/analyze
 ### 입력
 
 - detectedScale
-- noteEvents
 - adjustedNotes
 - chords
 
