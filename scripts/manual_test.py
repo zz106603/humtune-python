@@ -25,6 +25,23 @@ def _format_chords(chords: list) -> str:
     )
 
 
+def _format_note_starts(notes: list) -> str:
+    return " ".join(
+        f"{note.pitch}@{note.startTime:.2f}"
+        for note in notes
+    )
+
+
+def _format_chord_boundaries(chords: list) -> str:
+    return " ".join(
+        (
+            f"{chord.root}_{chord.type}:"
+            f"{chord.startTime:.2f}-{chord.startTime + chord.duration:.2f}"
+        )
+        for chord in chords
+    )
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print("Usage: python scripts/manual_test.py <path-to-audio>")
@@ -86,7 +103,9 @@ def main() -> int:
     print(f"cleanedNotes={_format_notes(result.cleaned_notes)}")
     print(f"adjustedNotes={_format_notes(result.adjusted_notes)}")
     print(f"finalMelodyNotes={_format_notes(result.quantized_notes)}")
+    print(f"finalMelodyStarts={_format_note_starts(result.quantized_notes)}")
     print(f"chords={_format_chords(result.chords)}")
+    print(f"chordBoundaries={_format_chord_boundaries(result.chords)}")
     print(f"rawMidiPath={raw_midi_path}")
     print(f"cleanedMidiPath={cleaned_midi_path}")
     print(f"finalMelodyMidiPath={final_melody_midi_path}")
