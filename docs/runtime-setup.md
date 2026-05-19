@@ -52,8 +52,8 @@ Manual MIDI files:
 - `manual-output/나비야-cleaned.mid`: melody after deterministic cleanup only
 - `manual-output/나비야-final-melody.mid`: final quantized melody only
 - `manual-output/나비야-chords.mid`: inferred sustained chords only
-- `manual-output/나비야-combined.mid`: final quantized melody plus inferred chords
-- `manual-output/나비야.mid`: default service-style MIDI output
+- `manual-output/나비야-combined.mid`: debug comparison MIDI with final quantized melody plus inferred chords
+- `manual-output/나비야.mid`: main product MIDI used by `midiPath`; final quantized melody plus inferred chords
 
 ## Windows Setup
 
