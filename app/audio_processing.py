@@ -63,6 +63,10 @@ MAJOR_CHORD_TIEBREAK_DEGREES = (0, 3, 4, 5, 1, 2, 6)
 MINOR_CHORD_TIEBREAK_DEGREES = (0, 3, 4, 5, 6, 2, 1)
 CHORD_WINDOW_ROOT_BONUS = 0.8
 CHORD_INITIAL_TONIC_BONUS = 0.5
+CHORD_BOUNDARY_SNAP_TOLERANCE_SECONDS = QUANTIZE_GRID_SECONDS * 1.5
+CHORD_FINAL_BOUNDARY_LOOKAHEAD_SECONDS = QUANTIZE_GRID_SECONDS * 2.0
+CHORD_MIN_SECTION_SECONDS = QUANTIZE_GRID_SECONDS * 3.0
+CHORD_FINAL_SUSTAIN_SECONDS = 60.0 / FALLBACK_TEMPO_BPM
 MIDI_TICKS_PER_BEAT = 480
 MIDI_MELODY_CHANNEL = 0
 MIDI_CHORD_CHANNEL = 1
@@ -1268,7 +1272,7 @@ def _infer_chords(notes: list[Note], scale_fit: ScaleFit) -> list[Chord]:
     if not chords:
         raise AudioProcessingError("Unable to infer chords")
 
-    return chords
+    return _normalize_chord_timing(chords, notes)
 
 
 def _chord_window_count(melody_duration: float) -> int:
@@ -1282,6 +1286,153 @@ def _chord_window_count(melody_duration: float) -> int:
             max(2, int(np.ceil(melody_duration / CHORD_TARGET_SECTION_SECONDS))),
         )
     return max(1, int(np.ceil(melody_duration / CHORD_WINDOW_SECONDS)))
+
+
+def _normalize_chord_timing(chords: list[Chord], notes: list[Note]) -> list[Chord]:
+    if not chords:
+        return []
+
+    ordered_chords = sorted(chords, key=lambda chord: chord.startTime)
+    melody_end_time = max(note.startTime + note.duration for note in notes)
+    boundaries = [ordered_chords[0].startTime]
+
+    for chord_index in range(1, len(ordered_chords)):
+        raw_boundary = ordered_chords[chord_index].startTime
+        previous_boundary = boundaries[-1]
+        next_boundary = (
+            ordered_chords[chord_index + 1].startTime
+            if chord_index + 1 < len(ordered_chords)
+            else melody_end_time
+        )
+        boundaries.append(
+            _normalize_chord_boundary(
+                raw_boundary,
+                previous_boundary,
+                next_boundary,
+                notes,
+                chord_index == len(ordered_chords) - 1,
+            )
+        )
+
+    final_end_time = melody_end_time + CHORD_FINAL_SUSTAIN_SECONDS
+    normalized_chords: list[Chord] = []
+    for chord_index, chord in enumerate(ordered_chords):
+        start_time = boundaries[chord_index]
+        end_time = (
+            boundaries[chord_index + 1]
+            if chord_index + 1 < len(boundaries)
+            else final_end_time
+        )
+        if end_time <= start_time:
+            end_time = start_time + CHORD_MIN_SECTION_SECONDS
+        normalized_chords.append(
+            Chord(
+                root=chord.root,
+                type=chord.type,
+                startTime=float(start_time),
+                duration=float(end_time - start_time),
+            )
+        )
+
+    return normalized_chords
+
+
+def _normalize_chord_boundary(
+    raw_boundary: float,
+    previous_boundary: float,
+    next_boundary: float,
+    notes: list[Note],
+    prefer_final_phrase: bool = False,
+) -> float:
+    boundary_epsilon = 1e-6
+    earliest_boundary = previous_boundary + CHORD_MIN_SECTION_SECONDS
+    latest_boundary = next_boundary - CHORD_MIN_SECTION_SECONDS
+    if latest_boundary + boundary_epsilon < earliest_boundary:
+        return raw_boundary
+
+    boundary_start = raw_boundary - CHORD_BOUNDARY_SNAP_TOLERANCE_SECONDS
+    boundary_end = raw_boundary + (
+        CHORD_FINAL_BOUNDARY_LOOKAHEAD_SECONDS
+        if prefer_final_phrase
+        else CHORD_BOUNDARY_SNAP_TOLERANCE_SECONDS
+    )
+    onset_candidates = [
+        note.startTime
+        for note in notes
+        if (
+            boundary_start - boundary_epsilon
+            <= note.startTime
+            <= boundary_end + boundary_epsilon
+        )
+        and (
+            earliest_boundary - boundary_epsilon
+            <= note.startTime
+            <= latest_boundary + boundary_epsilon
+        )
+    ]
+    if not onset_candidates:
+        return raw_boundary
+
+    if prefer_final_phrase:
+        final_phrase_candidates = [
+            onset
+            for onset in _unique_times(onset_candidates)
+            if onset >= raw_boundary
+            and _starts_closing_repeated_phrase(notes, onset)
+        ]
+        if final_phrase_candidates:
+            return min(final_phrase_candidates)
+
+    return min(
+        _unique_times(onset_candidates),
+        key=lambda onset: (
+            abs(onset - raw_boundary),
+            _active_note_count_at_boundary(notes, onset),
+            onset,
+        ),
+    )
+
+
+def _unique_times(values: list[float]) -> list[float]:
+    unique_values: list[float] = []
+    for value in sorted(values):
+        if not unique_values or not np.isclose(value, unique_values[-1], atol=1e-6):
+            unique_values.append(value)
+    return unique_values
+
+
+def _active_note_count_at_boundary(notes: list[Note], boundary_time: float) -> int:
+    return sum(
+        1
+        for note in notes
+        if note.startTime < boundary_time < note.startTime + note.duration
+    )
+
+
+def _starts_closing_repeated_phrase(notes: list[Note], onset_time: float) -> bool:
+    phrase_note = _note_starting_at(notes, onset_time)
+    if phrase_note is None or phrase_note.duration < AUDIBLE_MIN_NOTE_SECONDS:
+        return False
+
+    repeated_notes = [
+        note
+        for note in notes
+        if note.startTime >= phrase_note.startTime
+        and note.midi_note == phrase_note.midi_note
+        and note.duration >= AUDIBLE_MIN_NOTE_SECONDS
+    ]
+    return len(repeated_notes) >= 2
+
+
+def _note_starting_at(notes: list[Note], onset_time: float) -> Note | None:
+    starting_notes = [
+        note
+        for note in notes
+        if np.isclose(note.startTime, onset_time, atol=1e-6)
+    ]
+    if not starting_notes:
+        return None
+    return max(starting_notes, key=lambda note: (note.duration, note.velocity))
 
 
 def _scale_mode(scale_name: str) -> str:

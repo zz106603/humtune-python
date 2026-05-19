@@ -67,7 +67,8 @@ def analyze_audio(request: AudioAnalyzeRequest) -> AudioAnalyzeResponse:
         detectedScale=result.detectedScale,
         keyConfidence=result.keyConfidence,
         originalNotes=[note.pitch for note in result.original_notes],
-        adjustedNotes=[note.pitch for note in result.adjusted_notes],
+        # Legacy-compatible field name: expose the final quantized melody used by midiPath.
+        adjustedNotes=[note.pitch for note in result.quantized_notes],
         chords=[_format_chord(chord) for chord in result.chords],
         midiPath=result.midiPath,
         previewAudioPath=result.previewAudioPath,
