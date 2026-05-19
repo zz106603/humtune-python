@@ -1,9 +1,12 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import soundfile as sf
 from fastapi.testclient import TestClient
 
+import app.main as main_module
+from app.audio_processing import Chord, Note
 from app.main import app
 
 
@@ -45,6 +48,53 @@ def test_audio_analyze_success_creates_midi(tmp_path: Path) -> None:
     assert preview_audio_path.is_file()
     assert preview_audio_path.parent == output_directory
     assert preview_audio_path.suffix == ".wav"
+
+
+def test_audio_analyze_response_exposes_final_quantized_melody(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    midi_path = tmp_path / "output" / "melody.mid"
+    preview_audio_path = tmp_path / "output" / "melody-preview.wav"
+    midi_path.parent.mkdir(parents=True)
+    midi_path.write_bytes(b"midi")
+    preview_audio_path.write_bytes(b"preview")
+
+    def fake_process_audio(
+        audio_id: str,
+        raw_audio_path: str,
+        output_directory: str,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            detectedScale="C_MAJOR",
+            keyConfidence=0.91,
+            original_notes=[_note(61), _note(63)],
+            adjusted_notes=[_note(60), _note(62)],
+            quantized_notes=[_note(60), _note(64)],
+            chords=[Chord(root="C", type="MAJOR", startTime=0.0, duration=1.2)],
+            midiPath=str(midi_path),
+            previewAudioPath=str(preview_audio_path),
+        )
+
+    monkeypatch.setattr(main_module, "process_audio", fake_process_audio)
+
+    response = client.post(
+        "/internal/audio/analyze",
+        json={
+            "audioId": "melody",
+            "rawAudioPath": str(tmp_path / "melody.wav"),
+            "outputDirectory": str(tmp_path / "output"),
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "COMPLETED"
+    assert body["originalNotes"] == ["C#4", "D#4"]
+    assert body["adjustedNotes"] == ["C4", "E4"]
+    assert body["chords"] == ["C"]
+    assert body["midiPath"] == str(midi_path)
+    assert body["previewAudioPath"] == str(preview_audio_path)
 
 
 def test_audio_analyze_fails_for_missing_raw_audio_path(tmp_path: Path) -> None:
@@ -99,3 +149,14 @@ def _sine_wave(frequency: float, duration_seconds: float, sample_rate: int) -> n
         endpoint=False,
     )
     return (0.4 * np.sin(2 * np.pi * frequency * times)).astype(np.float32)
+
+
+def _note(midi_note: int) -> Note:
+    pitch_names = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+    return Note(
+        pitch=f"{pitch_names[midi_note % 12]}{(midi_note // 12) - 1}",
+        midi_note=midi_note,
+        startTime=0.0,
+        duration=0.3,
+        velocity=80,
+    )

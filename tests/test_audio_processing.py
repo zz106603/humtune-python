@@ -417,8 +417,8 @@ def test_infer_chords_uses_window_anchor_for_simple_major_melody() -> None:
         ("B", "MAJOR"),
         ("F#", "MAJOR"),
     ]
-    assert [chord.startTime for chord in chords] == pytest.approx([0.9, 2.325, 3.75, 5.175])
-    assert [chord.duration for chord in chords] == pytest.approx([1.425, 1.425, 1.425, 1.425])
+    assert [chord.startTime for chord in chords] == pytest.approx([0.9, 2.4, 3.9, 5.7])
+    assert [chord.duration for chord in chords] == pytest.approx([1.5, 1.5, 1.8, 1.5])
 
 
 def test_cleanup_notes_preserves_nearby_distinct_melody_notes() -> None:
