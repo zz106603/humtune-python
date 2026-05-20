@@ -16,6 +16,7 @@ from app.audio_processing import _adjust_notes_to_scale
 from app.audio_processing import _append_chord_events
 from app.audio_processing import _append_note_events
 from app.audio_processing import _basic_pitch_event_to_note
+from app.audio_processing import _calculate_melody_quality_analysis
 from app.audio_processing import _cleanup_notes
 from app.audio_processing import _cleanup_notes_with_metrics
 from app.audio_processing import _fit_scale
@@ -420,6 +421,79 @@ def test_infer_chords_uses_window_anchor_for_simple_major_melody() -> None:
     ]
     assert [chord.startTime for chord in chords] == pytest.approx([0.9, 2.4, 3.9, 5.7])
     assert [chord.duration for chord in chords] == pytest.approx([1.5, 1.5, 1.8, 1.5])
+
+
+def test_calculate_melody_quality_analysis_returns_json_ready_metrics_and_evidence() -> None:
+    scale = ScaleFit(
+        name="C_MAJOR",
+        root_pitch_class=0,
+        scale_pitch_classes=frozenset(MAJOR_SCALE_INTERVALS),
+        confidence=1.0,
+    )
+    cleaned_notes = [
+        _note(60, 0.0, 0.3),
+        _note(62, 0.3, 0.3),
+        _note(61, 0.6, 0.3),
+        _note(74, 0.9, 0.3),
+        _note(60, 1.2, 0.3),
+        _note(62, 1.5, 0.3),
+    ]
+    quantized_notes = [
+        _note(60, 0.0, 0.3),
+        _note(62, 0.3, 0.3),
+        _note(60, 0.6, 0.3),
+        _note(72, 0.9, 0.3),
+        _note(60, 1.2, 0.3),
+        _note(62, 1.5, 0.3),
+    ]
+    chords = [
+        Chord(root="C", type="MAJOR", startTime=0.0, duration=1.2),
+        Chord(root="D", type="MINOR", startTime=1.2, duration=0.9),
+    ]
+
+    analysis = _calculate_melody_quality_analysis(
+        cleaned_notes=cleaned_notes,
+        quantized_notes=quantized_notes,
+        scale_fit=scale,
+        chords=chords,
+    )
+
+    assert set(analysis.metrics) == {
+        "pitchStability",
+        "rhythmConsistency",
+        "noteDensity",
+        "intervalVariance",
+        "repetitionScore",
+        "chordToneAlignment",
+    }
+    assert analysis.metrics["rhythmConsistency"] == pytest.approx(1.0)
+    assert analysis.metrics["noteDensity"] == pytest.approx(3.3333)
+    assert analysis.evidence["offGridNoteCount"] == 0
+    assert analysis.evidence["scaleAdjustedNoteCount"] == 1
+    assert analysis.evidence["chordToneMatchedNotes"] == 5
+    assert analysis.evidence["largeIntervalJumps"] == [
+        {
+            "fromIndex": 2,
+            "toIndex": 3,
+            "fromPitch": "C4",
+            "toPitch": "C5",
+            "semitones": 12,
+        },
+        {
+            "fromIndex": 3,
+            "toIndex": 4,
+            "fromPitch": "C5",
+            "toPitch": "C4",
+            "semitones": -12,
+        },
+    ]
+    assert analysis.evidence["repeatedMotifs"] == [
+        {
+            "pitches": ["C4", "D4"],
+            "startIndexes": [0, 4],
+            "occurrences": 2,
+        }
+    ]
 
 
 def test_cleanup_notes_preserves_nearby_distinct_melody_notes() -> None:

@@ -139,6 +139,8 @@ class LoadedAudio:
     adjusted_notes: list[Note]
     quantized_notes: list[Note]
     chords: list[Chord]
+    melodyMetrics: dict[str, float]
+    feedbackEvidence: dict[str, Any]
     midiPath: str
     previewAudioPath: str | None
 
@@ -170,6 +172,12 @@ class QuantizeResult:
 class MidiEventMetrics:
     midi_event_count: int
     zero_or_negative_delta_count: int
+
+
+@dataclass(frozen=True)
+class MelodyQualityAnalysis:
+    metrics: dict[str, float]
+    evidence: dict[str, Any]
 
 
 class PreviewNote(NamedTuple):
@@ -210,6 +218,12 @@ def analyze_audio(
     _log_quantization_metrics(audio_id, quantize_result)
     _log_quantized_duration_stats(audio_id, quantized_notes)
     chords = _infer_chords(quantized_notes, scale_fit)
+    quality_analysis = _calculate_melody_quality_analysis(
+        cleaned_notes=cleaned_notes,
+        quantized_notes=quantized_notes,
+        scale_fit=scale_fit,
+        chords=chords,
+    )
     midi_path = _write_midi_file(audio_id, output_path, quantized_notes, chords)
     preview_audio_path = _try_write_wav_preview_file(audio_id, output_path, midi_path)
 
@@ -228,6 +242,8 @@ def analyze_audio(
         adjusted_notes=adjusted_notes,
         quantized_notes=quantized_notes,
         chords=chords,
+        melodyMetrics=quality_analysis.metrics,
+        feedbackEvidence=quality_analysis.evidence,
         midiPath=str(midi_path),
         previewAudioPath=str(preview_audio_path) if preview_audio_path else None,
     )
@@ -1563,6 +1579,166 @@ def _note_overlaps_window(note: Note, start_time: float, end_time: float) -> boo
     note_start = note.startTime
     note_end = note.startTime + note.duration
     return note_start < end_time and note_end > start_time
+
+
+def _calculate_melody_quality_analysis(
+    cleaned_notes: list[Note],
+    quantized_notes: list[Note],
+    scale_fit: ScaleFit,
+    chords: list[Chord],
+) -> MelodyQualityAnalysis:
+    if not quantized_notes:
+        raise AudioProcessingError("No notes available for melody quality analysis")
+
+    ordered_notes = sorted(quantized_notes, key=lambda note: (note.startTime, note.midi_note))
+    intervals = [
+        ordered_notes[index + 1].midi_note - ordered_notes[index].midi_note
+        for index in range(len(ordered_notes) - 1)
+    ]
+    absolute_intervals = [abs(interval) for interval in intervals]
+    durations = [note.duration for note in ordered_notes]
+    melody_start_time = min(note.startTime for note in ordered_notes)
+    melody_end_time = max(note.startTime + note.duration for note in ordered_notes)
+    melody_duration = max(melody_end_time - melody_start_time, AUDIBLE_MIN_NOTE_SECONDS)
+
+    off_grid_note_count = _off_grid_note_count(ordered_notes)
+    large_interval_jumps = _large_interval_jumps(ordered_notes)
+    repeated_motifs = _repeated_motifs(ordered_notes)
+    chord_tone_matched_notes = _chord_tone_matched_note_count(ordered_notes, chords)
+    scale_adjusted_note_count = _scale_adjusted_note_count(cleaned_notes, scale_fit)
+
+    interval_variance = float(np.var(intervals)) if intervals else 0.0
+    mean_interval = (
+        sum(absolute_intervals) / len(absolute_intervals)
+        if absolute_intervals
+        else 0.0
+    )
+    mean_duration = sum(durations) / len(durations)
+    duration_std = float(np.std(durations)) if len(durations) > 1 else 0.0
+    rhythm_variation = duration_std / mean_duration if mean_duration > 0 else 0.0
+
+    metrics = {
+        "pitchStability": _round_metric(1.0 - min(mean_interval, 12.0) / 12.0),
+        "rhythmConsistency": _round_metric(1.0 - min(rhythm_variation, 1.0)),
+        "noteDensity": _round_metric(len(ordered_notes) / melody_duration),
+        "intervalVariance": _round_metric(interval_variance),
+        "repetitionScore": _round_metric(_repetition_score(ordered_notes, repeated_motifs)),
+        "chordToneAlignment": _round_metric(chord_tone_matched_notes / len(ordered_notes)),
+    }
+    evidence = {
+        "offGridNoteCount": off_grid_note_count,
+        "largeIntervalJumps": large_interval_jumps,
+        "repeatedMotifs": repeated_motifs,
+        "chordToneMatchedNotes": chord_tone_matched_notes,
+        "scaleAdjustedNoteCount": scale_adjusted_note_count,
+    }
+    return MelodyQualityAnalysis(metrics=metrics, evidence=evidence)
+
+
+def _round_metric(value: float) -> float:
+    return round(float(max(0.0, value)), 4)
+
+
+def _off_grid_note_count(notes: list[Note]) -> int:
+    return sum(
+        1
+        for note in notes
+        if not np.isclose(note.startTime, _nearest_grid_time(note.startTime), atol=1e-6)
+    )
+
+
+def _large_interval_jumps(notes: list[Note]) -> list[dict[str, object]]:
+    jumps: list[dict[str, object]] = []
+    for index in range(len(notes) - 1):
+        interval = notes[index + 1].midi_note - notes[index].midi_note
+        if abs(interval) <= 7:
+            continue
+        jumps.append(
+            {
+                "fromIndex": index,
+                "toIndex": index + 1,
+                "fromPitch": notes[index].pitch,
+                "toPitch": notes[index + 1].pitch,
+                "semitones": interval,
+            }
+        )
+    return jumps
+
+
+def _repeated_motifs(notes: list[Note]) -> list[dict[str, object]]:
+    motif_positions: dict[tuple[int, ...], list[int]] = {}
+    for motif_length in (3, 2):
+        if len(notes) < motif_length * 2:
+            continue
+        for index in range(len(notes) - motif_length + 1):
+            motif = tuple(note.midi_note for note in notes[index:index + motif_length])
+            motif_positions.setdefault(motif, []).append(index)
+
+    repeated: list[dict[str, object]] = []
+    for motif, positions in sorted(
+        motif_positions.items(),
+        key=lambda item: (-len(item[1]), len(item[0]), item[1][0], item[0]),
+    ):
+        unique_positions = _non_overlapping_positions(positions, len(motif))
+        if len(unique_positions) < 2:
+            continue
+        repeated.append(
+            {
+                "pitches": [_midi_note_to_name(midi_note) for midi_note in motif],
+                "startIndexes": unique_positions,
+                "occurrences": len(unique_positions),
+            }
+        )
+        if len(repeated) >= 5:
+            break
+    return repeated
+
+
+def _non_overlapping_positions(positions: list[int], motif_length: int) -> list[int]:
+    selected_positions: list[int] = []
+    for position in positions:
+        if selected_positions and position < selected_positions[-1] + motif_length:
+            continue
+        selected_positions.append(position)
+    return selected_positions
+
+
+def _repetition_score(notes: list[Note], repeated_motifs: list[dict[str, object]]) -> float:
+    repeated_indexes: set[int] = set()
+    for motif in repeated_motifs:
+        pitches = motif["pitches"]
+        start_indexes = motif["startIndexes"]
+        if not isinstance(pitches, list) or not isinstance(start_indexes, list):
+            continue
+        for start_index in start_indexes:
+            if not isinstance(start_index, int):
+                continue
+            repeated_indexes.update(range(start_index, start_index + len(pitches)))
+    return len(repeated_indexes) / len(notes) if notes else 0.0
+
+
+def _chord_tone_matched_note_count(notes: list[Note], chords: list[Chord]) -> int:
+    matched_count = 0
+    for note in notes:
+        if any(
+            _note_overlaps_window(note, chord.startTime, chord.startTime + chord.duration)
+            and note.midi_note % 12 in _chord_pitch_classes(chord)
+            for chord in chords
+        ):
+            matched_count += 1
+    return matched_count
+
+
+def _chord_pitch_classes(chord: Chord) -> frozenset[int]:
+    return frozenset(midi_note % 12 for midi_note in _chord_to_midi_notes(chord))
+
+
+def _scale_adjusted_note_count(cleaned_notes: list[Note], scale_fit: ScaleFit) -> int:
+    return sum(
+        1
+        for note in cleaned_notes
+        if note.midi_note % 12 not in scale_fit.scale_pitch_classes
+    )
 
 
 def _write_midi_file(

@@ -177,6 +177,8 @@ Upload
 → scale fitting  
 → quantization  
 → chord inference  
+→ melody quality metrics
+→ feedback evidence
 → MIDI  
 → Spring orchestration  
 → AI 평가 및 피드백 생성  
@@ -252,6 +254,33 @@ tie-break:
 
 ---
 
+### 7.6 Melody Quality Metrics / Feedback Evidence
+
+Python Audio Service는 AI 피드백이 참조할 수 있는 deterministic metrics/evidence만 생성한다.
+AI는 이 값을 설명과 평가에 사용할 수 있지만 note, scale, chord, MIDI를 결정하거나 수정하지 않는다.
+
+metrics:
+
+- pitchStability
+- rhythmConsistency
+- noteDensity
+- intervalVariance
+- repetitionScore
+- chordToneAlignment
+
+evidence:
+
+- offGridNoteCount
+- largeIntervalJumps
+- repeatedMotifs
+- chordToneMatchedNotes
+- scaleAdjustedNoteCount
+
+모든 값은 Basic Pitch 이후의 cleanup, scale fitting, scale adjustment, quantization, chord inference 결과에서만 계산한다.
+응답 값은 JSON-serializable object로 제한한다.
+
+---
+
 ## 8. 실패 처리
 
 ### 8.1 Transcription 실패
@@ -310,6 +339,8 @@ POST /internal/audio/analyze
 - originalNotes
 - adjustedNotes
 - chords
+- melodyMetrics
+- feedbackEvidence
 - midiPath
 - previewAudioPath
 - processingTimeMs
@@ -326,6 +357,8 @@ POST /internal/audio/analyze
 - originalNotes: Basic Pitch raw note event에서 추출한 원본 note name sequence. 사용자 표시용 최종 melody가 아니라 진단 및 호환용 필드
 - adjustedNotes: legacy-compatible field name. API가 노출하는 최종 melody note name sequence이며 cleanup, scale adjustment, quantization이 모두 적용된 melody이다. midiPath의 melody track과 의미적으로 일치해야 한다
 - chords: 최종 chord inference 결과의 chord label sequence만 노출한다. chord startTime/duration은 API 응답에 포함하지 않는다
+- melodyMetrics: 최종 deterministic pipeline 산출물에서 계산한 melody quality metric object. AI 피드백의 근거로만 사용하며 생성 로직에 관여하지 않는다
+- feedbackEvidence: metrics를 설명할 때 사용할 수 있는 deterministic evidence object. count와 짧은 list/dict만 포함하며 JSON-serializable이어야 한다
 - midiPath: 서비스의 main product MIDI. 최종 melody와 timing-normalized inferred chord/accompaniment를 포함하며 preview/download의 기준 파일이다
 - previewAudioPath: midiPath에서 렌더링한 선택적 WAV preview 경로. preview 생성이 실패하면 생략될 수 있다
 - processingTimeMs: Python 분석 처리 시간
@@ -358,6 +391,8 @@ raw, cleaned, adjusted, melody-only, chord-only, combined 비교 산출물은 ma
 - detectedScale
 - adjustedNotes
 - chords
+- melodyMetrics
+- feedbackEvidence
 
 ---
 

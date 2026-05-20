@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -28,6 +30,14 @@ class AudioAnalyzeResponse(BaseModel):
     chords: list[str] | None = Field(
         default=None,
         description="Final inferred chord labels used by the product MIDI accompaniment.",
+    )
+    melodyMetrics: dict[str, float] | None = Field(
+        default=None,
+        description="Deterministic melody quality metrics derived from final pipeline outputs.",
+    )
+    feedbackEvidence: dict[str, Any] | None = Field(
+        default=None,
+        description="JSON-serializable evidence for feedback generated from deterministic pipeline outputs.",
     )
     midiPath: str | None = Field(
         default=None,

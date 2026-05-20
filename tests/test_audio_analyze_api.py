@@ -38,6 +38,8 @@ def test_audio_analyze_success_creates_midi(tmp_path: Path) -> None:
     assert body["originalNotes"]
     assert body["adjustedNotes"]
     assert body["chords"]
+    assert body["melodyMetrics"]
+    assert body["feedbackEvidence"]
     assert body["midiPath"]
     assert body["previewAudioPath"]
     assert isinstance(body["processingTimeMs"], int)
@@ -72,6 +74,21 @@ def test_audio_analyze_response_exposes_final_quantized_melody(
             adjusted_notes=[_note(60), _note(62)],
             quantized_notes=[_note(60), _note(64)],
             chords=[Chord(root="C", type="MAJOR", startTime=0.0, duration=1.2)],
+            melodyMetrics={
+                "pitchStability": 0.67,
+                "rhythmConsistency": 1.0,
+                "noteDensity": 6.67,
+                "intervalVariance": 0.0,
+                "repetitionScore": 0.0,
+                "chordToneAlignment": 1.0,
+            },
+            feedbackEvidence={
+                "offGridNoteCount": 0,
+                "largeIntervalJumps": [],
+                "repeatedMotifs": [],
+                "chordToneMatchedNotes": 2,
+                "scaleAdjustedNoteCount": 2,
+            },
             midiPath=str(midi_path),
             previewAudioPath=str(preview_audio_path),
         )
@@ -93,6 +110,8 @@ def test_audio_analyze_response_exposes_final_quantized_melody(
     assert body["originalNotes"] == ["C#4", "D#4"]
     assert body["adjustedNotes"] == ["C4", "E4"]
     assert body["chords"] == ["C"]
+    assert body["melodyMetrics"]["pitchStability"] == 0.67
+    assert body["feedbackEvidence"]["chordToneMatchedNotes"] == 2
     assert body["midiPath"] == str(midi_path)
     assert body["previewAudioPath"] == str(preview_audio_path)
 
